@@ -70,6 +70,89 @@ extern "C" {
     // tensor copy between different backends
     GGML_API void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst);
 
+    // Experimental process-global hook for replacing selected MoE expert weight copies.
+    //
+    // The callback is invoked from the backend scheduler before the normal copy of selected
+    // experts from src_tensor to dst_tensor. Returning true means the callback fully handled
+    // the split input for this node, either by copying the requested experts into dst_tensor
+    // after the scheduler has made dst_tensor safe to write, or by patching node->src[0]/src[2]
+    // to backend-resident replacement tensors. Returning false means fallback to the normal
+    // scheduler copy; in that case the callback must leave the graph and dst_tensor unmodified.
+    //
+    // When ggml_backend_set_moe_weight_copy_defer_input_wait(true) is active, the scheduler may
+    // deliberately delay the split input wait. In that mode callbacks must not write dst_tensor;
+    // they may only patch node->src[0]/src[2] and return true, or return false with no mutation.
+    //
+    // The callback and user_data are process-global. Register it only while the user_data is
+    // alive, filter unrelated tensors/contexts inside the callback, and unregister it before
+    // destroying user_data. The callback/defer/debug setters are not synchronized with in-flight
+    // scheduler execution; change them between runs or after draining the relevant backends.
+    typedef bool (*ggml_backend_moe_weight_copy_callback)(
+            ggml_backend_t             dst_backend,
+            struct ggml_tensor *       dst_tensor,
+            const struct ggml_tensor * src_tensor,
+            const int32_t *            expert_ids,
+            size_t                     expert_id_count,
+            size_t                     expert_size,
+            struct ggml_tensor *       node,
+            const struct ggml_tensor * ids_tensor,
+            const int32_t *            ids_data,
+            size_t                     ids_data_count,
+            bool                       ids_synchronized,
+            void *                     user_data);
+
+    GGML_API void ggml_backend_set_moe_weight_copy_callback(
+            ggml_backend_moe_weight_copy_callback callback,
+            void *                               user_data);
+    GGML_API void ggml_backend_set_moe_weight_copy_defer_input_wait(bool enabled);
+
+    struct ggml_backend_moe_weight_copy_stats {
+        uint64_t split_inputs;
+        uint64_t user_inputs;
+        uint64_t graph_empty;
+        uint64_t non_weight_inputs;
+        uint64_t non_host_weight_inputs;
+        uint64_t first_node_not_mul_mat_id;
+        uint64_t src0_mismatch;
+        uint64_t eligible;
+        uint64_t ids_refreshes;
+        uint64_t callback_attempts;
+        uint64_t callback_handled;
+        uint64_t callback_fallback;
+        uint64_t graph_patches;
+        uint64_t graph_patch_restores;
+        uint64_t normal_copy_fallback;
+        uint64_t backend_sync_calls;
+        uint64_t backend_sync_us;
+        uint64_t event_sync_calls;
+        uint64_t event_sync_us;
+        uint64_t event_wait_calls;
+        uint64_t event_wait_us;
+        uint64_t graph_compute_calls;
+        uint64_t graph_compute_us;
+        uint64_t user_input_wait_calls;
+        uint64_t user_input_wait_us;
+        uint64_t split_input_wait_calls;
+        uint64_t split_input_wait_us;
+        uint64_t defer_input_wait_skips;
+        uint64_t defer_input_wait_disabled_events;
+        uint64_t moe_input_sync_calls;
+        uint64_t moe_input_sync_us;
+        uint64_t ids_readback_calls;
+        uint64_t ids_readback_us;
+        uint64_t callback_us;
+        uint64_t normal_copy_us;
+    };
+
+    // Diagnostic counters only. get snapshots each field independently with relaxed atomics, so
+    // related call/time fields are not guaranteed to come from one coherent instant. reset is also
+    // per-field and may discard increments if called concurrently with scheduler execution.
+    // Set MOEVM_FORCE_STATS=1 before process start to keep low-level backend timing counters active
+    // even when no MoE callback/defer/debug hook is registered.
+    GGML_API void ggml_backend_get_moe_weight_copy_stats(struct ggml_backend_moe_weight_copy_stats * stats);
+    GGML_API void ggml_backend_reset_moe_weight_copy_stats(void);
+    GGML_API void ggml_backend_set_moe_weight_copy_debug(int max_lines);
+
     //
     // Backend (stream)
     //
