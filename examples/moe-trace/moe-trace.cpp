@@ -47,6 +47,7 @@ struct moevm_local_params {
     int copy_debug = 0;
     bool direct_mmap = false;
     bool nocache = true;
+    bool verify_integrity = true;
     bool shadow_ids = false;
     int compact_layer = -1;
     int compact_k_max = 64;
@@ -622,6 +623,14 @@ static bool parse_local_arg(
         }
         if (arg == "--moevm-nocache") {
             moevm_params.nocache = true;
+            continue;
+        }
+        if (arg == "--moevm-no-integrity-check") {
+            moevm_params.verify_integrity = false;
+            continue;
+        }
+        if (arg == "--moevm-integrity-check") {
+            moevm_params.verify_integrity = true;
             continue;
         }
         if (arg == "--moevm-shadow-ids") {
@@ -2793,6 +2802,7 @@ int main(int argc, char ** argv) {
             runtime_options.prefetch_threads = (uint32_t) moevm_params.threads;
             runtime_options.nocache = moevm_params.nocache;
             runtime_options.direct_mmap = moevm_params.direct_mmap;
+            runtime_options.verify_integrity = moevm_params.verify_integrity;
             runtime_options.inject_delay_max_us = moevm_params.inject_delay_max_us;
             runtime_options.inject_delay_seed = moevm_params.inject_delay_seed;
             state.runtime.reset(new moevm::Runtime(runtime_options));
