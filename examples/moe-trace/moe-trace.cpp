@@ -1459,21 +1459,36 @@ static bool moevm_graph_fill_pool_for_topk(
             break;
         }
         pool_slot->tensor->ne[2] = state->moevm_pool_capacity;
-        for (size_t j = 0; j < unique_ids.size(); ++j) {
-            const uint32_t expert = (uint32_t) unique_ids[j];
-            const int32_t slot = plan.slot_by_selected[j];
-            if (slot < 0 || slot >= state->moevm_pool_capacity) {
-                pool_ok = false;
-                break;
-            }
+    }
+
+    for (size_t j = 0; pool_ok && j < unique_ids.size(); ++j) {
+        const uint32_t expert = (uint32_t) unique_ids[j];
+        const int32_t slot = plan.slot_by_selected[j];
+        if (slot < 0 || slot >= state->moevm_pool_capacity) {
+            pool_ok = false;
+            break;
+        }
+
+        bool needs_record = false;
+        for (pool_weight_slot * pool_slot : component_slots) {
             if (pool_slot->loaded_expert_by_slot[(size_t) slot] == (int32_t) expert) {
                 ++state->moevm_pool_component_hits;
-                continue;
+            } else {
+                needs_record = true;
             }
-            try {
+        }
+        if (!needs_record) {
+            continue;
+        }
+
+        try {
+            moevm::RecordView record = state->runtime->wait_selected(layer, expert);
+            moevm_record_guard record_guard(state->runtime.get(), record);
+            for (pool_weight_slot * pool_slot : component_slots) {
+                if (pool_slot->loaded_expert_by_slot[(size_t) slot] == (int32_t) expert) {
+                    continue;
+                }
                 moevm_inject_delay(state, ((uint64_t) layer << 32) ^ ((uint64_t) expert << 2) ^ (uint64_t) pool_slot->component ^ 0x67726170ull);
-                moevm::RecordView record = state->runtime->wait_selected(layer, expert);
-                moevm_record_guard record_guard(state->runtime.get(), record);
                 moevm::ComponentView view = state->runtime->component_view(record, pool_slot->component);
                 if (view.bytes != pool_slot->expert_size) {
                     moevm_set_runtime_error(state, std::string("MoEVM graph-mode component size mismatch for ") + pool_slot->src_tensor->name);
@@ -1487,13 +1502,10 @@ static bool moevm_graph_fill_pool_for_topk(
                 ++state->moevm_copy_memcpy_ops;
                 ++state->moevm_copy_experts;
                 state->moevm_copy_bytes += view.bytes;
-            } catch (const std::exception & e) {
-                moevm_set_runtime_error(state, e.what());
-                pool_ok = false;
-                break;
             }
-        }
-        if (!pool_ok) {
+        } catch (const std::exception & e) {
+            moevm_set_runtime_error(state, e.what());
+            pool_ok = false;
             break;
         }
     }

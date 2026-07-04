@@ -2133,6 +2133,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (g_moe_graph_pool_callback != nullptr) {
             bool graph_pool_ok = true;
+            ggml_tensor * graph_pool_split_ids_tensor = nullptr;
+            ggml_tensor * graph_pool_split_shadow = nullptr;
             for (int j = 0; j < split->graph.n_nodes; ++j) {
                 ggml_tensor * node = split->graph.nodes[j];
                 if (!ggml_backend_moe_is_graph_pool_node(node) || node->src[2] == nullptr) {
@@ -2140,6 +2142,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 ggml_tensor * ids_tensor = node->src[2];
+                if (ids_tensor == graph_pool_split_ids_tensor && graph_pool_split_shadow != nullptr) {
+                    ggml_tensor * original_src0 = node->src[0];
+                    ggml_tensor * original_src2 = node->src[2];
+                    node->src[2] = graph_pool_split_shadow;
+                    remember_moe_graph_patch(node, original_src0, original_src2);
+                    continue;
+                }
+
                 ggml_backend_t ids_backend = ggml_backend_sched_get_tensor_backend(sched, ids_tensor);
                 if (ids_backend == nullptr) {
                     ids_backend = split_backend;
@@ -2179,6 +2189,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (handled) {
                     if (node_patched) {
                         remember_moe_graph_patch(node, original_src0, original_src2);
+                    }
+                    if (node->src[2] != original_src2) {
+                        graph_pool_split_ids_tensor = ids_tensor;
+                        graph_pool_split_shadow = node->src[2];
                     }
                     ++g_moe_weight_copy_stats.callback_handled;
                 } else {
