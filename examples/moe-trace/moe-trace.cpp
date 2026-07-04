@@ -12,6 +12,7 @@
 
 #include <cerrno>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <clocale>
 #include <cstdint>
@@ -25,6 +26,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <dispatch/dispatch.h>
+#endif
 
 enum class moevm_copy_mode {
     async,
@@ -58,6 +63,10 @@ struct moevm_local_params {
     bool self_test_pool_pinning = false;
     bool test_force_pinned_fence = false;
     bool speculative = false;
+    bool load_only = false;
+    bool pressure_trim = false;
+    double pressure_trim_step_gib = 2.0;
+    double pressure_trim_min_gib = 8.0;
     uint32_t inject_delay_max_us = 0;
     uint64_t inject_delay_seed = 0x9e3779b97f4a7c15ull;
     moevm_copy_mode copy_mode = moevm_copy_mode::async;
@@ -226,6 +235,14 @@ struct moe_trace_state {
     uint64_t moevm_graph_patch_fallback = 0;
     uint64_t moevm_graph_topk_fills = 0;
     uint64_t moevm_graph_fill_fallback = 0;
+    std::atomic<bool> moevm_pressure_trim_active{false};
+    uint64_t moevm_pressure_trim_step_bytes = 0;
+    uint64_t moevm_pressure_trim_min_bytes = 0;
+    std::atomic<uint64_t> moevm_pressure_warn_events{0};
+    std::atomic<uint64_t> moevm_pressure_critical_events{0};
+    std::atomic<uint64_t> moevm_pressure_trim_calls{0};
+    std::atomic<uint64_t> moevm_pressure_trim_records{0};
+    std::atomic<uint64_t> moevm_pressure_trim_bytes{0};
     bool moevm_shadow_ids = false;
     int moevm_compact_layer = -1;
     int moevm_compact_k_max = 64;
@@ -358,6 +375,119 @@ static void moevm_set_runtime_error(moe_trace_state * state, const std::string &
     }
 }
 
+struct moevm_pressure_trim_context {
+#if defined(__APPLE__)
+    dispatch_source_t source = nullptr;
+#endif
+    moe_trace_state * state = nullptr;
+};
+
+#if defined(__APPLE__)
+static const char * moevm_pressure_level_name(unsigned long flags) {
+    if (flags & DISPATCH_MEMORYPRESSURE_CRITICAL) {
+        return "critical";
+    }
+    if (flags & DISPATCH_MEMORYPRESSURE_WARN) {
+        return "warn";
+    }
+    if (flags & DISPATCH_MEMORYPRESSURE_NORMAL) {
+        return "normal";
+    }
+    return "unknown";
+}
+
+static void moevm_memory_pressure_handler(void * user_data) {
+    auto * context = static_cast<moevm_pressure_trim_context *>(user_data);
+    if (!context || !context->state) {
+        return;
+    }
+    moe_trace_state * state = context->state;
+    if (!state->moevm_pressure_trim_active.load(std::memory_order_acquire) || !state->runtime) {
+        return;
+    }
+
+    const unsigned long flags = context->source ? dispatch_source_get_data(context->source) : 0;
+    if (flags & DISPATCH_MEMORYPRESSURE_CRITICAL) {
+        state->moevm_pressure_critical_events.fetch_add(1, std::memory_order_relaxed);
+    } else if (flags & DISPATCH_MEMORYPRESSURE_WARN) {
+        state->moevm_pressure_warn_events.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        return;
+    }
+
+    try {
+        const moevm::RuntimeMetrics before = state->runtime->metrics();
+        const uint64_t min_bytes = state->moevm_pressure_trim_min_bytes;
+        const uint64_t base_step = state->moevm_pressure_trim_step_bytes;
+        const uint64_t step_bytes = (flags & DISPATCH_MEMORYPRESSURE_CRITICAL) ? base_step * 2 : base_step;
+        if (before.arena_used_bytes <= min_bytes || step_bytes == 0) {
+            LOG_WRN("MoEVM memory pressure trim skipped: level=%s used=%.2fGiB min=%.2fGiB\n",
+                    moevm_pressure_level_name(flags),
+                    (double) before.arena_used_bytes / 1024.0 / 1024.0 / 1024.0,
+                    (double) min_bytes / 1024.0 / 1024.0 / 1024.0);
+            return;
+        }
+
+        uint64_t target = before.arena_used_bytes > step_bytes ? before.arena_used_bytes - step_bytes : 0;
+        target = std::max(target, min_bytes);
+        const uint64_t evicted = state->runtime->trim_to_bytes(target);
+        const moevm::RuntimeMetrics after = state->runtime->metrics();
+        const uint64_t freed = before.arena_used_bytes > after.arena_used_bytes ? before.arena_used_bytes - after.arena_used_bytes : 0;
+        state->moevm_pressure_trim_calls.fetch_add(1, std::memory_order_relaxed);
+        state->moevm_pressure_trim_records.fetch_add(evicted, std::memory_order_relaxed);
+        state->moevm_pressure_trim_bytes.fetch_add(freed, std::memory_order_relaxed);
+
+        LOG_WRN("MoEVM memory pressure trim: level=%s used %.2fGiB -> %.2fGiB target=%.2fGiB evicted=%llu freed=%.2fGiB live_reclaim=%.2fGiB\n",
+                moevm_pressure_level_name(flags),
+                (double) before.arena_used_bytes / 1024.0 / 1024.0 / 1024.0,
+                (double) after.arena_used_bytes / 1024.0 / 1024.0 / 1024.0,
+                (double) target / 1024.0 / 1024.0 / 1024.0,
+                (unsigned long long) evicted,
+                (double) freed / 1024.0 / 1024.0 / 1024.0,
+                (double) after.arena_reclaim_live_bytes / 1024.0 / 1024.0 / 1024.0);
+    } catch (const std::exception & e) {
+        moevm_set_runtime_error(state, std::string("memory pressure trim failed: ") + e.what());
+    } catch (...) {
+        moevm_set_runtime_error(state, "memory pressure trim failed: unknown exception");
+    }
+}
+
+static bool moevm_start_pressure_trim(moevm_pressure_trim_context & context, moe_trace_state & state) {
+    context.state = &state;
+    context.source = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+            DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    if (!context.source) {
+        return false;
+    }
+    dispatch_set_context(context.source, &context);
+    dispatch_source_set_event_handler_f(context.source, moevm_memory_pressure_handler);
+    state.moevm_pressure_trim_active.store(true, std::memory_order_release);
+    dispatch_resume(context.source);
+    return true;
+}
+
+static void moevm_stop_pressure_trim(moevm_pressure_trim_context & context, moe_trace_state & state) {
+    state.moevm_pressure_trim_active.store(false, std::memory_order_release);
+    if (context.source) {
+        dispatch_source_cancel(context.source);
+#if !defined(OS_OBJECT_USE_OBJC) || !OS_OBJECT_USE_OBJC
+        dispatch_release(context.source);
+#endif
+        context.source = nullptr;
+    }
+    context.state = nullptr;
+}
+#else
+static bool moevm_start_pressure_trim(moevm_pressure_trim_context &, moe_trace_state &) {
+    return false;
+}
+
+static void moevm_stop_pressure_trim(moevm_pressure_trim_context &, moe_trace_state & state) {
+    state.moevm_pressure_trim_active.store(false, std::memory_order_release);
+}
+#endif
+
 struct moevm_record_guard {
     moevm::Runtime * runtime = nullptr;
     moevm::RecordView record{};
@@ -417,6 +547,13 @@ static bool parse_moevm_graph_mode(const std::string & value, moevm_graph_mode &
         return true;
     }
     return false;
+}
+
+static uint64_t moevm_gib_to_bytes(double gib) {
+    if (gib <= 0.0) {
+        return 0;
+    }
+    return (uint64_t) (gib * 1024.0 * 1024.0 * 1024.0);
 }
 
 static bool parse_local_arg(
@@ -759,6 +896,42 @@ static bool parse_local_arg(
         }
         if (arg.rfind("--moevm-resident-cache-unsafe=", 0) == 0) {
             moevm_params.resident_cache = std::atoi(arg.substr(std::strlen("--moevm-resident-cache-unsafe=")).c_str()) != 0;
+            continue;
+        }
+        if (arg == "--moevm-load-only") {
+            moevm_params.load_only = true;
+            continue;
+        }
+        if (arg == "--moevm-pressure-trim") {
+            moevm_params.pressure_trim = true;
+            continue;
+        }
+        if (arg.rfind("--moevm-pressure-trim=", 0) == 0) {
+            moevm_params.pressure_trim = std::atoi(arg.substr(std::strlen("--moevm-pressure-trim=")).c_str()) != 0;
+            continue;
+        }
+        if (arg == "--moevm-pressure-trim-step-gib") {
+            if (i + 1 >= argc) {
+                LOG_ERR("--moevm-pressure-trim-step-gib requires a number\n");
+                return false;
+            }
+            moevm_params.pressure_trim_step_gib = std::atof(argv[++i]);
+            continue;
+        }
+        if (arg.rfind("--moevm-pressure-trim-step-gib=", 0) == 0) {
+            moevm_params.pressure_trim_step_gib = std::atof(arg.substr(std::strlen("--moevm-pressure-trim-step-gib=")).c_str());
+            continue;
+        }
+        if (arg == "--moevm-pressure-trim-min-gib") {
+            if (i + 1 >= argc) {
+                LOG_ERR("--moevm-pressure-trim-min-gib requires a number\n");
+                return false;
+            }
+            moevm_params.pressure_trim_min_gib = std::atof(argv[++i]);
+            continue;
+        }
+        if (arg.rfind("--moevm-pressure-trim-min-gib=", 0) == 0) {
+            moevm_params.pressure_trim_min_gib = std::atof(arg.substr(std::strlen("--moevm-pressure-trim-min-gib=")).c_str());
             continue;
         }
         filtered.push_back(argv[i]);
@@ -2722,6 +2895,21 @@ int main(int argc, char ** argv) {
         !moevm_params.component_index_path.empty() ||
         !moevm_params.sidecar_path.empty();
     const bool trace_enabled = !trace_out.empty();
+    if (moevm_params.pressure_trim) {
+        if (!moevm_enabled) {
+            LOG_ERR("--moevm-pressure-trim requires MoEVM runtime inputs\n");
+            return 1;
+        }
+        if (moevm_params.pressure_trim_step_gib <= 0.0) {
+            LOG_ERR("--moevm-pressure-trim-step-gib must be positive\n");
+            return 1;
+        }
+        if (moevm_params.pressure_trim_min_gib < 0.0 ||
+                moevm_params.pressure_trim_min_gib > moevm_params.arena_gib) {
+            LOG_ERR("--moevm-pressure-trim-min-gib must be between 0 and --moevm-arena-gib\n");
+            return 1;
+        }
+    }
 
     moe_trace_state state;
     state.candidate_limit = candidate_limit;
@@ -2739,6 +2927,8 @@ int main(int argc, char ** argv) {
     state.moevm_inject_delay_max_us = moevm_params.inject_delay_max_us;
     state.moevm_delay_state = moevm_params.inject_delay_seed;
     state.moevm_graph_mode_value = moevm_params.graph_mode;
+    state.moevm_pressure_trim_step_bytes = moevm_gib_to_bytes(moevm_params.pressure_trim_step_gib);
+    state.moevm_pressure_trim_min_bytes = moevm_gib_to_bytes(moevm_params.pressure_trim_min_gib);
     const bool needs_cb_eval = trace_enabled;
     if (trace_enabled) {
         state.out = std::fopen(trace_out.c_str(), "w");
@@ -2815,7 +3005,7 @@ int main(int argc, char ** argv) {
             } else {
                 ggml_backend_set_moe_weight_copy_callback(nullptr, nullptr);
             }
-            LOG_INF("MoEVM enabled: arena=%.2fGiB inflight=%.2fMiB threads=%d prefetch_topk=%d copy_debug=%d direct_mmap=%d nocache=%d copy_mode=%s shadow_ids=%d compact_layer=%d compact_k_max=%d pool_layer=%d pool_capacity=%d graph_mode=%s resident_cache=%d defer_input_wait=%d inject_delay_us=%u test_force_pinned_fence=%d\n",
+            LOG_INF("MoEVM enabled: arena=%.2fGiB inflight=%.2fMiB threads=%d prefetch_topk=%d copy_debug=%d direct_mmap=%d nocache=%d copy_mode=%s shadow_ids=%d compact_layer=%d compact_k_max=%d pool_layer=%d pool_capacity=%d graph_mode=%s resident_cache=%d defer_input_wait=%d inject_delay_us=%u test_force_pinned_fence=%d pressure_trim=%d pressure_trim_step_gib=%.2f pressure_trim_min_gib=%.2f\n",
                     moevm_params.arena_gib, moevm_params.inflight_mib, moevm_params.threads, moevm_params.prefetch_topk, moevm_params.copy_debug, moevm_params.direct_mmap ? 1 : 0,
                     moevm_params.nocache ? 1 : 0,
                     moevm_copy_mode_name(moevm_params.copy_mode),
@@ -2828,7 +3018,10 @@ int main(int argc, char ** argv) {
                     moevm_params.resident_cache ? 1 : 0,
                     state.moevm_defer_input_wait ? 1 : 0,
                     moevm_params.inject_delay_max_us,
-                    state.moevm_test_force_pinned_fence ? 1 : 0);
+                    state.moevm_test_force_pinned_fence ? 1 : 0,
+                    moevm_params.pressure_trim ? 1 : 0,
+                    moevm_params.pressure_trim_step_gib,
+                    moevm_params.pressure_trim_min_gib);
         } catch (const std::exception & e) {
             LOG_ERR("failed to initialize MoEVM runtime: %s\n", e.what());
             if (state.out) {
@@ -2886,10 +3079,30 @@ int main(int argc, char ** argv) {
                 ggml_backend_buft_name(state.moevm_graph_buft));
     }
 
-    LOG_INF("%s\n", common_params_get_system_info(params).c_str());
+    moevm_pressure_trim_context pressure_trim_context;
+    if (moevm_params.pressure_trim) {
+        if (!moevm_start_pressure_trim(pressure_trim_context, state)) {
+            LOG_ERR("failed to start MoEVM memory pressure trim listener\n");
+            if (state.out) {
+                std::fclose(state.out);
+            }
+            llama_backend_free();
+            return 1;
+        }
+        LOG_INF("MoEVM memory pressure trim armed: step=%.2fGiB min=%.2fGiB\n",
+                moevm_params.pressure_trim_step_gib,
+                moevm_params.pressure_trim_min_gib);
+    }
 
-    const bool run_speculative = moevm_params.speculative || params.speculative.has_dft();
-    const bool ok = run_speculative ? run_speculative_trace(ctx, params, state) : run_trace(ctx, params, state);
+    bool ok = true;
+    if (moevm_params.load_only) {
+        LOG_INF("MoEVM load-only requested: model/context/runtime initialized; skipping trace/decode\n");
+    } else {
+        LOG_INF("%s\n", common_params_get_system_info(params).c_str());
+        const bool run_speculative = moevm_params.speculative || params.speculative.has_dft();
+        ok = run_speculative ? run_speculative_trace(ctx, params, state) : run_trace(ctx, params, state);
+    }
+    moevm_stop_pressure_trim(pressure_trim_context, state);
     if (ok && !generated_out.empty()) {
         const llama_vocab * vocab = llama_model_get_vocab(model);
         const std::string text = common_detokenize(vocab, state.generated_tokens, false);
@@ -2981,6 +3194,19 @@ int main(int argc, char ** argv) {
                 (double) m.arena_high_water_bytes / 1024.0 / 1024.0 / 1024.0,
                 (unsigned long long) m.delay_injections,
                 (unsigned long long) m.delay_us);
+        LOG_INF("MoEVM runtime arena used=%.2fGiB reclaim_advises=%llu reclaim=%.2fGiB reclaim_live=%.2fGiB reuse_advises=%llu reuse=%.2fGiB\n",
+                (double) m.arena_used_bytes / 1024.0 / 1024.0 / 1024.0,
+                (unsigned long long) m.arena_reclaim_advises,
+                (double) m.arena_reclaim_bytes / 1024.0 / 1024.0 / 1024.0,
+                (double) m.arena_reclaim_live_bytes / 1024.0 / 1024.0 / 1024.0,
+                (unsigned long long) m.arena_reuse_advises,
+                (double) m.arena_reuse_bytes / 1024.0 / 1024.0 / 1024.0);
+        LOG_INF("MoEVM pressure_trim warn_events=%llu critical_events=%llu trim_calls=%llu trim_records=%llu trim_bytes=%.2fGiB\n",
+                (unsigned long long) state.moevm_pressure_warn_events.load(std::memory_order_relaxed),
+                (unsigned long long) state.moevm_pressure_critical_events.load(std::memory_order_relaxed),
+                (unsigned long long) state.moevm_pressure_trim_calls.load(std::memory_order_relaxed),
+                (unsigned long long) state.moevm_pressure_trim_records.load(std::memory_order_relaxed),
+                (double) state.moevm_pressure_trim_bytes.load(std::memory_order_relaxed) / 1024.0 / 1024.0 / 1024.0);
         LOG_INF("MoEVM backend copy_stats split_inputs=%llu user_inputs=%llu eligible=%llu ids_refreshes=%llu attempts=%llu handled=%llu callback_fallback=%llu graph_patches=%llu graph_patch_restores=%llu normal_fallback=%llu graph_empty=%llu non_weight=%llu non_host_weight=%llu first_node_not_mul_mat_id=%llu src0_mismatch=%llu\n",
                 (unsigned long long) copy_stats.split_inputs,
                 (unsigned long long) copy_stats.user_inputs,
