@@ -1343,6 +1343,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+        if (!graph_transform(gf)) {
+            LLAMA_LOG_ERROR("%s: graph transform callback failed\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -2382,6 +2387,11 @@ ggml_cgraph * llama_context::graph_reserve(
 
     this->n_outputs = save_n_outputs;
 
+    if (!graph_transform(gf)) {
+        LLAMA_LOG_ERROR("%s: graph transform callback failed\n", __func__);
+        return nullptr;
+    }
+
     // initialize scheduler with the specified graph
     if (split_only) {
         if (sizes) {
@@ -2420,6 +2430,40 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+}
+
+void llama_context::set_graph_transform_callback(llama_graph_transform_callback callback, void * user_data) {
+    graph_transform_cb = callback;
+    graph_transform_user_data = user_data;
+    sched_need_reserve = true;
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+}
+
+int32_t llama_context::get_n_backends() const {
+    return (int32_t) backend_ptrs.size();
+}
+
+ggml_backend_t llama_context::get_backend(int32_t i) const {
+    if (i < 0 || i >= (int32_t) backend_ptrs.size()) {
+        return nullptr;
+    }
+    return backend_ptrs[(size_t) i];
+}
+
+ggml_backend_buffer_type_t llama_context::get_backend_buffer_type(int32_t i) const {
+    if (i < 0 || i >= (int32_t) backend_buft.size()) {
+        return nullptr;
+    }
+    return backend_buft[(size_t) i];
+}
+
+bool llama_context::graph_transform(ggml_cgraph * gf) {
+    if (!graph_transform_cb) {
+        return true;
+    }
+    return graph_transform_cb(gf, graph_transform_user_data);
 }
 
 ggml_status llama_context::graph_compute(
@@ -3618,8 +3662,20 @@ enum llama_pooling_type llama_pooling_type(const llama_context * ctx) {
     return ctx->pooling_type();
 }
 
+int32_t llama_get_n_backends(const llama_context * ctx) {
+    return ctx->get_n_backends();
+}
+
+ggml_backend_t llama_get_backend(const llama_context * ctx, int32_t i) {
+    return ctx->get_backend(i);
+}
+
+ggml_backend_buffer_type_t llama_get_backend_buffer_type(const llama_context * ctx, int32_t i) {
+    return ctx->get_backend_buffer_type(i);
+}
+
 void llama_attach_threadpool(
-            llama_context * ctx,
+        llama_context * ctx,
         ggml_threadpool_t   threadpool,
         ggml_threadpool_t   threadpool_batch) {
     ctx->attach_threadpool(threadpool, threadpool_batch);
@@ -3739,6 +3795,13 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
+}
+
+void llama_set_graph_transform_callback(
+        llama_context * ctx,
+        llama_graph_transform_callback callback,
+        void * user_data) {
+    ctx->set_graph_transform_callback(callback, user_data);
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {

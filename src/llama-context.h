@@ -247,6 +247,11 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    void set_graph_transform_callback(llama_graph_transform_callback callback, void * user_data);
+    int32_t get_n_backends() const;
+    ggml_backend_t get_backend(int32_t i) const;
+    ggml_backend_buffer_type_t get_backend_buffer_type(int32_t i) const;
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
@@ -261,6 +266,8 @@ private:
                           llm_graph_type   gtype) const;
 
     llm_graph_cb graph_get_cb() const;
+
+    bool graph_transform(ggml_cgraph * gf);
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
@@ -362,6 +369,9 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    llama_graph_transform_callback graph_transform_cb = nullptr;
+    void * graph_transform_user_data = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

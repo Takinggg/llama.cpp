@@ -33,6 +33,8 @@
 
 static ggml_backend_moe_weight_copy_callback g_moe_weight_copy_callback = nullptr;
 static void * g_moe_weight_copy_callback_user_data = nullptr;
+static ggml_backend_moe_graph_pool_callback g_moe_graph_pool_callback = nullptr;
+static void * g_moe_graph_pool_callback_user_data = nullptr;
 static std::atomic<int> g_moe_weight_copy_debug_remaining{0};
 static bool g_moe_weight_copy_defer_input_wait = false;
 static const bool g_moe_weight_copy_force_stats = getenv("MOEVM_FORCE_STATS") != nullptr;
@@ -105,6 +107,7 @@ static moe_weight_copy_atomic_stats g_moe_weight_copy_stats = {};
 static bool ggml_backend_moe_weight_copy_collect_stats() {
     return g_moe_weight_copy_force_stats ||
         g_moe_weight_copy_callback != nullptr ||
+        g_moe_graph_pool_callback != nullptr ||
         g_moe_weight_copy_defer_input_wait ||
         g_moe_weight_copy_debug_remaining.load(std::memory_order_relaxed) > 0;
 }
@@ -125,6 +128,13 @@ void ggml_backend_set_moe_weight_copy_callback(
 
 void ggml_backend_set_moe_weight_copy_defer_input_wait(bool enabled) {
     g_moe_weight_copy_defer_input_wait = enabled;
+}
+
+void ggml_backend_set_moe_graph_pool_callback(
+        ggml_backend_moe_graph_pool_callback callback,
+        void * user_data) {
+    g_moe_graph_pool_callback = callback;
+    g_moe_graph_pool_callback_user_data = user_data;
 }
 
 void ggml_backend_get_moe_weight_copy_stats(struct ggml_backend_moe_weight_copy_stats * stats) {
@@ -262,6 +272,14 @@ static size_t ggml_backend_moe_ids_read_bytes(const ggml_tensor * ids_tensor) {
         (uint64_t) (ids_tensor->ne[1] - 1) * ids_tensor->nb[1] +
         type_size;
     return std::max<size_t>(ggml_nbytes(ids_tensor), (size_t) max_off);
+}
+
+static bool ggml_backend_moe_is_graph_pool_node(const ggml_tensor * node) {
+    constexpr const char * prefix = "moevm_pool_";
+    return node != nullptr &&
+        node->op == GGML_OP_MUL_MAT_ID &&
+        node->src[0] != nullptr &&
+        std::strncmp(node->src[0]->name, prefix, std::strlen(prefix)) == 0;
 }
 
 const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
@@ -1517,6 +1535,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->i_start = 0;
         split->n_inputs = 0;
         int cur_backend_id = split->backend_id;
+        const ggml_tensor * cur_split_pool_ids = nullptr;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
 
@@ -1530,6 +1549,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
+            const bool is_graph_pool_node = ggml_backend_moe_is_graph_pool_node(node);
+            if (g_moe_graph_pool_callback != nullptr &&
+                    is_graph_pool_node &&
+                    node->src[2] != nullptr &&
+                    cur_split_pool_ids != nullptr &&
+                    cur_split_pool_ids != node->src[2]) {
+                need_new_split = true;
+            }
+            if (g_moe_graph_pool_callback != nullptr &&
+                    is_graph_pool_node &&
+                    node->src[2] != nullptr &&
+                    cur_split_pool_ids == nullptr &&
+                    i > split->i_start) {
+                need_new_split = true;
+            }
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
@@ -1572,7 +1606,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->backend_id = node_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
+                cur_split_pool_ids = nullptr;
                 cur_backend_id = node_backend_id;
+            }
+            if (is_graph_pool_node && node->src[2] != nullptr && cur_split_pool_ids == nullptr) {
+                cur_split_pool_ids = node->src[2];
             }
 
             // find inputs that are not on the same backend
@@ -1808,7 +1846,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     };
 
     ggml_tensor * prev_ids_tensor = nullptr;
+    ggml_tensor * graph_pool_prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
+    std::vector<int32_t> graph_pool_ids;
     std::vector<int32_t> moe_unique_ids;
     std::vector<ggml_bitset_t> used_ids;
 
@@ -2064,6 +2104,72 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     g_moe_weight_copy_stats.normal_copy_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_normal_copy_us);
                 }
+            }
+        }
+
+        if (g_moe_graph_pool_callback != nullptr) {
+            bool graph_pool_ok = true;
+            for (int j = 0; j < split->graph.n_nodes; ++j) {
+                ggml_tensor * node = split->graph.nodes[j];
+                if (!ggml_backend_moe_is_graph_pool_node(node) || node->src[2] == nullptr) {
+                    continue;
+                }
+
+                ggml_tensor * ids_tensor = node->src[2];
+                ggml_backend_t ids_backend = ggml_backend_sched_get_tensor_backend(sched, ids_tensor);
+                if (ids_backend == nullptr) {
+                    ids_backend = split_backend;
+                }
+
+                bool ids_synchronized = false;
+                if (ids_tensor != graph_pool_prev_ids_tensor) {
+                    const size_t ids_read_bytes = ggml_backend_moe_ids_read_bytes(ids_tensor);
+                    graph_pool_ids.resize((ids_read_bytes + sizeof(int32_t) - 1) / sizeof(int32_t));
+                    const int64_t t_ids_readback_us = ggml_time_us();
+                    if (ids_read_bytes > 0) {
+                        ggml_backend_tensor_get_async(ids_backend, ids_tensor, graph_pool_ids.data(), 0, ids_read_bytes);
+                    }
+                    ggml_backend_synchronize(ids_backend);
+                    ids_synchronized = true;
+                    ++g_moe_weight_copy_stats.ids_readback_calls;
+                    g_moe_weight_copy_stats.ids_readback_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_ids_readback_us);
+                    ++g_moe_weight_copy_stats.ids_refreshes;
+                    graph_pool_prev_ids_tensor = ids_tensor;
+                }
+
+                ggml_tensor * original_src0 = node->src[0];
+                ggml_tensor * original_src2 = node->src[2];
+                ++g_moe_weight_copy_stats.callback_attempts;
+                const int64_t t_callback_us = ggml_time_us();
+                const bool handled = g_moe_graph_pool_callback(
+                        split_backend,
+                        node,
+                        ids_tensor,
+                        graph_pool_ids.data(),
+                        graph_pool_ids.size(),
+                        ids_synchronized,
+                        g_moe_graph_pool_callback_user_data);
+                g_moe_weight_copy_stats.callback_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_callback_us);
+
+                const bool node_patched = node->src[0] != original_src0 || node->src[2] != original_src2;
+                if (handled) {
+                    if (node_patched) {
+                        remember_moe_graph_patch(node, original_src0, original_src2);
+                    }
+                    ++g_moe_weight_copy_stats.callback_handled;
+                } else {
+                    if (node_patched) {
+                        node->src[0] = original_src0;
+                        node->src[2] = original_src2;
+                    }
+                    ++g_moe_weight_copy_stats.callback_fallback;
+                    graph_pool_ok = false;
+                    break;
+                }
+            }
+            if (!graph_pool_ok) {
+                restore_moe_graph_patches();
+                return GGML_STATUS_FAILED;
             }
         }
 

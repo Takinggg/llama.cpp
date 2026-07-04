@@ -106,6 +106,23 @@ extern "C" {
             void *                               user_data);
     GGML_API void ggml_backend_set_moe_weight_copy_defer_input_wait(bool enabled);
 
+    // Experimental process-global hook for graph-resident MoE expert pools. The scheduler invokes
+    // this before a split containing MUL_MAT_ID nodes whose weight tensor name starts with
+    // "moevm_pool_". The callback may fill the pool tensor(s) and patch node->src[2] to a shadow
+    // ids tensor. Any graph mutation is restored by the scheduler after the split.
+    typedef bool (*ggml_backend_moe_graph_pool_callback)(
+            ggml_backend_t             backend,
+            struct ggml_tensor *       node,
+            const struct ggml_tensor * ids_tensor,
+            const int32_t *            ids_data,
+            size_t                     ids_data_count,
+            bool                       ids_synchronized,
+            void *                     user_data);
+
+    GGML_API void ggml_backend_set_moe_graph_pool_callback(
+            ggml_backend_moe_graph_pool_callback callback,
+            void *                              user_data);
+
     struct ggml_backend_moe_weight_copy_stats {
         uint64_t split_inputs;
         uint64_t user_inputs;

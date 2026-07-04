@@ -336,6 +336,8 @@ extern "C" {
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
+    typedef bool (*llama_graph_transform_callback)(struct ggml_cgraph * gf, void * user_data);
+
     struct llama_context_params {
         uint32_t n_ctx;             // text context, 0 = from model
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
@@ -557,6 +559,11 @@ extern "C" {
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
+
+    // [EXPERIMENTAL]
+    LLAMA_API int32_t llama_get_n_backends(const struct llama_context * ctx);
+    LLAMA_API ggml_backend_t llama_get_backend(const struct llama_context * ctx, int32_t i);
+    LLAMA_API ggml_backend_buffer_type_t llama_get_backend_buffer_type(const struct llama_context * ctx, int32_t i);
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
@@ -1288,6 +1295,15 @@ extern "C" {
     // attach a sampler to the context
     // note: prefer initializing the context with llama_context_params.samplers when possible
     LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
+
+    // [EXPERIMENTAL]
+    // Process-local graph transform hook. Called after model.build_graph() and before scheduler
+    // allocation/splitting. Intended for experiments that replace graph inputs with stable
+    // backend-resident tensors. Return false to abort the current graph.
+    LLAMA_API void llama_set_graph_transform_callback(
+            struct llama_context * ctx,
+            llama_graph_transform_callback callback,
+            void * user_data);
 
     // mirror of llama_sampler_i:
     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);

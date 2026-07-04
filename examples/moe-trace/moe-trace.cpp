@@ -31,6 +31,11 @@ enum class moevm_copy_mode {
     memcpy,
 };
 
+enum class moevm_graph_mode {
+    off,
+    pool,
+};
+
 struct moevm_local_params {
     std::string index_path;
     std::string component_index_path;
@@ -55,6 +60,7 @@ struct moevm_local_params {
     uint32_t inject_delay_max_us = 0;
     uint64_t inject_delay_seed = 0x9e3779b97f4a7c15ull;
     moevm_copy_mode copy_mode = moevm_copy_mode::async;
+    moevm_graph_mode graph_mode = moevm_graph_mode::off;
 };
 
 struct copy_prefetch_cache_entry {
@@ -101,6 +107,7 @@ struct pool_weight_slot {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
     ggml_tensor * tensor = nullptr;
+    const ggml_tensor * src_tensor = nullptr;
     enum ggml_type type = GGML_TYPE_COUNT;
     uint32_t layer = 0;
     int64_t ne0 = 0;
@@ -213,6 +220,11 @@ struct moe_trace_state {
     uint64_t moevm_resident_cache_misses = 0;
     uint64_t moevm_resident_cache_resets = 0;
     uint64_t moevm_runtime_errors = 0;
+    uint64_t moevm_graph_patch_attempts = 0;
+    uint64_t moevm_graph_patch_applied = 0;
+    uint64_t moevm_graph_patch_fallback = 0;
+    uint64_t moevm_graph_topk_fills = 0;
+    uint64_t moevm_graph_fill_fallback = 0;
     bool moevm_shadow_ids = false;
     int moevm_compact_layer = -1;
     int moevm_compact_k_max = 64;
@@ -224,6 +236,9 @@ struct moe_trace_state {
     bool moevm_test_force_pinned_fence_done = false;
     uint32_t moevm_inject_delay_max_us = 0;
     moevm_copy_mode moevm_copy_mode_value = moevm_copy_mode::async;
+    moevm_graph_mode moevm_graph_mode_value = moevm_graph_mode::off;
+    ggml_backend_t moevm_graph_backend = nullptr;
+    ggml_backend_buffer_type_t moevm_graph_buft = nullptr;
 
     ~moe_trace_state() {
         close_logits_out();
@@ -376,6 +391,28 @@ static bool parse_moevm_copy_mode(const std::string & value, moevm_copy_mode & m
     }
     if (value == "memcpy") {
         mode = moevm_copy_mode::memcpy;
+        return true;
+    }
+    return false;
+}
+
+static const char * moevm_graph_mode_name(moevm_graph_mode mode) {
+    switch (mode) {
+        case moevm_graph_mode::off:
+            return "off";
+        case moevm_graph_mode::pool:
+            return "pool";
+    }
+    return "unknown";
+}
+
+static bool parse_moevm_graph_mode(const std::string & value, moevm_graph_mode & mode) {
+    if (value == "off") {
+        mode = moevm_graph_mode::off;
+        return true;
+    }
+    if (value == "pool") {
+        mode = moevm_graph_mode::pool;
         return true;
     }
     return false;
@@ -557,6 +594,20 @@ static bool parse_local_arg(
         if (arg.rfind("--moevm-copy-mode=", 0) == 0) {
             if (!parse_moevm_copy_mode(arg.substr(std::strlen("--moevm-copy-mode=")), moevm_params.copy_mode)) {
                 LOG_ERR("--moevm-copy-mode must be async or memcpy\n");
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--moevm-graph-mode") {
+            if (i + 1 >= argc || !parse_moevm_graph_mode(argv[++i], moevm_params.graph_mode)) {
+                LOG_ERR("--moevm-graph-mode requires one of: off, pool\n");
+                return false;
+            }
+            continue;
+        }
+        if (arg.rfind("--moevm-graph-mode=", 0) == 0) {
+            if (!parse_moevm_graph_mode(arg.substr(std::strlen("--moevm-graph-mode=")), moevm_params.graph_mode)) {
+                LOG_ERR("--moevm-graph-mode requires one of: off, pool\n");
                 return false;
             }
             continue;
@@ -784,20 +835,18 @@ static bool build_shadow_ids_remap_i32(
     if (n_expert <= 0 || (size_t) n_expert > remap.size()) {
         return false;
     }
+    (void) ids_data_count;
 
     const size_t shadow_count = ggml_nbytes(shadow) / sizeof(int32_t);
     shadow_ids_tmp.assign(shadow_count, 0);
 
     for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; ++i1) {
         for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; ++i0) {
-            size_t src_index = 0;
             size_t dst_index = 0;
-            if (!moevm_tensor_i32_index(ids_tensor, i0, i1, src_index) ||
-                    !moevm_tensor_i32_index(shadow, i0, i1, dst_index) ||
-                    src_index >= ids_data_count || dst_index >= shadow_count) {
+            if (!moevm_tensor_i32_index(shadow, i0, i1, dst_index) || dst_index >= shadow_count) {
                 return false;
             }
-            const int32_t expert = ids_data[src_index];
+            const int32_t expert = (int32_t) get_i64((const uint8_t *) ids_data, ids_tensor, i0, i1);
             if (expert < 0 || expert >= n_expert || remap[(size_t) expert] < 0) {
                 return false;
             }
@@ -1065,6 +1114,7 @@ static pool_weight_slot * get_or_create_pool_weight_slot(
     slot.ctx = ctx;
     slot.buffer = buffer;
     slot.tensor = tensor;
+    slot.src_tensor = src_tensor;
     slot.type = src_tensor->type;
     slot.layer = layer;
     slot.ne0 = src_tensor->ne[0];
@@ -1106,6 +1156,57 @@ static layer_pool_state * get_or_create_layer_pool(
     pool.last_epoch_by_slot.assign((size_t) capacity, 0);
     state->layer_pools.push_back(pool);
     return &state->layer_pools.back();
+}
+
+static bool collect_unique_i32_ids(
+        const ggml_tensor * ids_tensor,
+        const int32_t * ids_data,
+        size_t ids_data_count,
+        int64_t n_expert,
+        std::vector<int32_t> & unique_ids,
+        std::string * error = nullptr) {
+    if (!ids_tensor || !ids_data || ids_tensor->type != GGML_TYPE_I32 || n_expert <= 0) {
+        if (error) {
+            *error = "invalid tensor/type/expert count";
+        }
+        return false;
+    }
+    (void) ids_data_count;
+
+    std::vector<uint8_t> used_ids((size_t) n_expert, 0);
+    unique_ids.clear();
+    for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; ++i1) {
+        for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; ++i0) {
+            const int32_t id = (int32_t) get_i64((const uint8_t *) ids_data, ids_tensor, i0, i1);
+            if (id < 0 || id >= n_expert) {
+                if (error) {
+                    char buf[512];
+                    std::snprintf(buf, sizeof(buf),
+                            "invalid id tensor=%s i0=%lld i1=%lld id=%d n_expert=%lld ne=[%lld,%lld] nb=[%zu,%zu] nbytes=%zu",
+                            ids_tensor->name,
+                            (long long) i0,
+                            (long long) i1,
+                            id,
+                            (long long) n_expert,
+                            (long long) ids_tensor->ne[0],
+                            (long long) ids_tensor->ne[1],
+                            ids_tensor->nb[0],
+                            ids_tensor->nb[1],
+                            ggml_nbytes(ids_tensor));
+                    *error = buf;
+                }
+                return false;
+            }
+            used_ids[(size_t) id] = 1;
+        }
+    }
+    for (int32_t id = 0; id < n_expert; ++id) {
+        if (used_ids[(size_t) id] != 0) {
+            unique_ids.push_back(id);
+        }
+    }
+    (void) error;
+    return true;
 }
 
 static bool plan_pool_slots(
@@ -1208,6 +1309,283 @@ static void commit_pool_slot_plan(
         pool->last_used_by_slot[(size_t) slot] = ++pool->tick;
         pool->last_epoch_by_slot[(size_t) slot] = patch_epoch;
     }
+}
+
+static void moevm_inject_delay(moe_trace_state * state, uint64_t salt);
+static void maybe_force_pinned_fence_once(
+        moe_trace_state * state,
+        layer_pool_state * pool,
+        const int32_t * expert_ids,
+        size_t expert_id_count);
+
+static bool moevm_graph_fill_pool_for_topk(
+        moe_trace_state * state,
+        uint32_t layer,
+        const ggml_tensor * ids_tensor,
+        const uint8_t * ids_bytes) {
+    if (!state || state->moevm_graph_mode_value != moevm_graph_mode::pool || !state->runtime) {
+        return true;
+    }
+    if (!ids_tensor || !ids_bytes || ids_tensor->type != GGML_TYPE_I32) {
+        moevm_set_runtime_error(state, "MoEVM graph-mode requires I32 topk ids");
+        ++state->moevm_graph_fill_fallback;
+        return false;
+    }
+
+    std::vector<pool_weight_slot *> component_slots;
+    for (pool_weight_slot & slot : state->pool_weight_slots) {
+        if (slot.backend == state->moevm_graph_backend &&
+                slot.buft == state->moevm_graph_buft &&
+                slot.layer == layer &&
+                slot.src_tensor != nullptr) {
+            component_slots.push_back(&slot);
+        }
+    }
+    if (component_slots.empty()) {
+        return true;
+    }
+
+    pool_weight_slot * first_slot = component_slots.front();
+    const int64_t n_expert = first_slot->src_tensor->ne[2];
+    const size_t ids_data_count = ggml_nbytes(ids_tensor) / sizeof(int32_t);
+    const int32_t * ids_data = (const int32_t *) ids_bytes;
+    std::vector<int32_t> unique_ids;
+    std::string collect_error;
+    if (!collect_unique_i32_ids(ids_tensor, ids_data, ids_data_count, n_expert, unique_ids, &collect_error)) {
+        moevm_set_runtime_error(state, std::string("MoEVM graph-mode failed to collect topk ids: ") + collect_error);
+        ++state->moevm_graph_fill_fallback;
+        return false;
+    }
+    if (unique_ids.empty()) {
+        return true;
+    }
+    if (unique_ids.size() > (size_t) state->moevm_pool_capacity) {
+        moevm_set_runtime_error(state, "MoEVM graph-mode topk union exceeds pool capacity");
+        ++state->moevm_fallback_k_overflow;
+        ++state->moevm_graph_fill_fallback;
+        return false;
+    }
+
+    layer_pool_state * layer_pool = get_or_create_layer_pool(
+            state, state->moevm_graph_backend, state->moevm_graph_buft, layer, n_expert, state->moevm_pool_capacity);
+    ggml_tensor * shadow = get_or_create_shadow_ids_tensor(
+            state, shadow_ids_kind::pool, state->moevm_graph_backend, state->moevm_graph_buft, ids_tensor);
+    if (!layer_pool || !shadow || !shadow->data) {
+        moevm_set_runtime_error(state, "MoEVM graph-mode failed to allocate layer pool or shadow ids");
+        ++state->moevm_graph_fill_fallback;
+        return false;
+    }
+
+    if (state->moevm_pool_completed_epoch != state->moevm_pool_submit_epoch) {
+        state->moevm_pool_completed_epoch = state->moevm_pool_submit_epoch;
+        ++state->moevm_pool_epoch_drains;
+    }
+
+    pool_slot_plan plan;
+    bool blocked_by_pinned_slot = false;
+    maybe_force_pinned_fence_once(state, layer_pool, unique_ids.data(), unique_ids.size());
+    bool pool_ok = plan_pool_slots(state, layer_pool, unique_ids.data(), unique_ids.size(), plan, blocked_by_pinned_slot);
+    if (!pool_ok && blocked_by_pinned_slot) {
+        ggml_backend_synchronize(state->moevm_graph_backend);
+        state->moevm_pool_completed_epoch = state->moevm_pool_submit_epoch;
+        ++state->moevm_pool_forced_fences;
+        blocked_by_pinned_slot = false;
+        pool_ok = plan_pool_slots(state, layer_pool, unique_ids.data(), unique_ids.size(), plan, blocked_by_pinned_slot);
+    }
+    if (!pool_ok) {
+        moevm_set_runtime_error(state, "MoEVM graph-mode failed to plan pool slots");
+        ++state->moevm_pool_fallback_plan;
+        ++state->moevm_graph_fill_fallback;
+        return false;
+    }
+
+    std::vector<int32_t> remap((size_t) n_expert, -1);
+    for (size_t j = 0; j < unique_ids.size(); ++j) {
+        const int32_t expert = unique_ids[j];
+        if (expert >= 0 && expert < n_expert) {
+            remap[(size_t) expert] = plan.slot_by_selected[j];
+        }
+    }
+
+    std::vector<int32_t> shadow_ids_tmp;
+    if (!build_shadow_ids_remap_i32(ids_tensor, ids_data, ids_data_count, shadow, remap, n_expert, shadow_ids_tmp)) {
+        moevm_set_runtime_error(state, "MoEVM graph-mode failed to remap shadow ids");
+        ++state->moevm_pool_fallback_remap;
+        ++state->moevm_graph_fill_fallback;
+        return false;
+    }
+
+    std::vector<std::pair<pool_weight_slot *, int32_t>> touched_slots;
+    for (pool_weight_slot * pool_slot : component_slots) {
+        if (!pool_slot || !pool_slot->tensor || !pool_slot->tensor->data || !pool_slot->src_tensor) {
+            pool_ok = false;
+            break;
+        }
+        pool_slot->tensor->ne[2] = state->moevm_pool_capacity;
+        for (size_t j = 0; j < unique_ids.size(); ++j) {
+            const uint32_t expert = (uint32_t) unique_ids[j];
+            const int32_t slot = plan.slot_by_selected[j];
+            if (slot < 0 || slot >= state->moevm_pool_capacity) {
+                pool_ok = false;
+                break;
+            }
+            if (pool_slot->loaded_expert_by_slot[(size_t) slot] == (int32_t) expert) {
+                ++state->moevm_pool_component_hits;
+                continue;
+            }
+            try {
+                moevm_inject_delay(state, ((uint64_t) layer << 32) ^ ((uint64_t) expert << 2) ^ (uint64_t) pool_slot->component ^ 0x67726170ull);
+                moevm::RecordView record = state->runtime->wait_selected(layer, expert);
+                moevm_record_guard record_guard(state->runtime.get(), record);
+                moevm::ComponentView view = state->runtime->component_view(record, pool_slot->component);
+                if (view.bytes != pool_slot->expert_size) {
+                    moevm_set_runtime_error(state, std::string("MoEVM graph-mode component size mismatch for ") + pool_slot->src_tensor->name);
+                    pool_ok = false;
+                    break;
+                }
+                std::memcpy((uint8_t *) pool_slot->tensor->data + (size_t) slot * pool_slot->expert_size, view.data, view.bytes);
+                pool_slot->loaded_expert_by_slot[(size_t) slot] = (int32_t) expert;
+                touched_slots.push_back({pool_slot, slot});
+                ++state->moevm_pool_component_misses;
+                ++state->moevm_copy_memcpy_ops;
+                ++state->moevm_copy_experts;
+                state->moevm_copy_bytes += view.bytes;
+            } catch (const std::exception & e) {
+                moevm_set_runtime_error(state, e.what());
+                pool_ok = false;
+                break;
+            }
+        }
+        if (!pool_ok) {
+            break;
+        }
+    }
+
+    if (!pool_ok) {
+        for (const auto & touched : touched_slots) {
+            if (touched.first && touched.second >= 0 && touched.second < (int32_t) touched.first->loaded_expert_by_slot.size()) {
+                touched.first->loaded_expert_by_slot[(size_t) touched.second] = -1;
+            }
+        }
+        ++state->moevm_pool_fallback_fill;
+        ++state->moevm_graph_fill_fallback;
+        return false;
+    }
+
+    std::memcpy(shadow->data, shadow_ids_tmp.data(), ggml_nbytes(shadow));
+    const uint64_t patch_epoch = ++state->moevm_pool_submit_epoch;
+    commit_pool_slot_plan(state, layer_pool, plan, patch_epoch);
+    ++state->moevm_graph_topk_fills;
+    return true;
+}
+
+static bool moevm_graph_transform_cb(ggml_cgraph * gf, void * user_data) {
+    auto * state = (moe_trace_state *) user_data;
+    if (!state || state->moevm_graph_mode_value == moevm_graph_mode::off) {
+        return true;
+    }
+    if (state->moevm_graph_mode_value != moevm_graph_mode::pool) {
+        return true;
+    }
+    if (!state->moevm_graph_backend || !state->moevm_graph_buft) {
+        moevm_set_runtime_error(state, "MoEVM graph-mode has no target backend");
+        return false;
+    }
+
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (!node || node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[2]) {
+            continue;
+        }
+
+        uint32_t layer = 0;
+        moevm::ExpertComponent component = moevm::ExpertComponent::Gate;
+        const ggml_tensor * src_tensor = node->src[0];
+        if (!parse_routed_tensor_component(src_tensor->name, layer, component)) {
+            continue;
+        }
+
+        const bool wants_pool = state->moevm_pool_layer == -2 || (state->moevm_pool_layer >= 0 && (int) layer == state->moevm_pool_layer);
+        if (!wants_pool) {
+            continue;
+        }
+
+        ++state->moevm_graph_patch_attempts;
+        ggml_tensor * ids_tensor = node->src[2];
+        const int64_t n_expert = src_tensor->ne[2];
+        const size_t expert_size = src_tensor->nb[2];
+        layer_pool_state * layer_pool = get_or_create_layer_pool(
+                state, state->moevm_graph_backend, state->moevm_graph_buft, layer, n_expert, state->moevm_pool_capacity);
+        pool_weight_slot * pool_slot = get_or_create_pool_weight_slot(
+                state, state->moevm_graph_backend, state->moevm_graph_buft, src_tensor, layer, component, state->moevm_pool_capacity, expert_size);
+        ggml_tensor * shadow = get_or_create_shadow_ids_tensor(
+                state, shadow_ids_kind::pool, state->moevm_graph_backend, state->moevm_graph_buft, ids_tensor);
+
+        if (!layer_pool || !pool_slot || !pool_slot->tensor || !pool_slot->tensor->data || !shadow || !shadow->data) {
+            moevm_set_runtime_error(state, std::string("MoEVM graph-mode failed to allocate pool tensors for ") + src_tensor->name);
+            ++state->moevm_graph_patch_fallback;
+            return false;
+        }
+        if (ggml_n_dims(src_tensor) != 3 || ids_tensor->type != GGML_TYPE_I32 || pool_slot->tensor->nb[2] != expert_size) {
+            moevm_set_runtime_error(state, std::string("MoEVM graph-mode unsupported tensor shape for ") + src_tensor->name);
+            ++state->moevm_graph_patch_fallback;
+            return false;
+        }
+
+        pool_slot->tensor->ne[2] = state->moevm_pool_capacity;
+        node->src[0] = pool_slot->tensor;
+        ++state->moevm_graph_patch_applied;
+    }
+    return true;
+}
+
+static bool moevm_graph_pool_sched_cb(
+        ggml_backend_t backend,
+        ggml_tensor * node,
+        const ggml_tensor * ids_tensor,
+        const int32_t * ids_data,
+        size_t ids_data_count,
+        bool ids_synchronized,
+        void * user_data) {
+    auto * state = (moe_trace_state *) user_data;
+    if (!state || state->moevm_graph_mode_value != moevm_graph_mode::pool || !state->runtime ||
+            !node || !node->src[0] || !ids_tensor || !ids_data) {
+        return false;
+    }
+    if (backend != state->moevm_graph_backend) {
+        moevm_set_runtime_error(state, "MoEVM graph pool scheduler backend mismatch");
+        return false;
+    }
+
+    pool_weight_slot * matched_slot = nullptr;
+    for (pool_weight_slot & slot : state->pool_weight_slots) {
+        if (slot.tensor == node->src[0]) {
+            matched_slot = &slot;
+            break;
+        }
+    }
+    if (!matched_slot) {
+        moevm_set_runtime_error(state, "MoEVM graph pool scheduler could not match pool tensor");
+        return false;
+    }
+
+    if (ids_synchronized && !moevm_graph_fill_pool_for_topk(
+                state,
+                matched_slot->layer,
+                ids_tensor,
+                (const uint8_t *) ids_data)) {
+        return false;
+    }
+
+    ggml_tensor * shadow = get_or_create_shadow_ids_tensor(
+            state, shadow_ids_kind::pool, state->moevm_graph_backend, state->moevm_graph_buft, ids_tensor);
+    if (!shadow || !shadow->data) {
+        moevm_set_runtime_error(state, "MoEVM graph pool scheduler failed to allocate shadow ids");
+        return false;
+    }
+    (void) ids_data_count;
+    node->src[2] = shadow;
+    return true;
 }
 
 static void moevm_inject_delay(moe_trace_state * state, uint64_t salt) {
@@ -1807,7 +2185,7 @@ static bool moe_trace_cb_eval(ggml_tensor * t, bool ask, void * user_data) {
         return true;
     }
 
-    if (!state || !state->out) {
+    if (!state) {
         return true;
     }
 
@@ -1855,6 +2233,11 @@ static bool moe_trace_cb_eval(ggml_tensor * t, bool ask, void * user_data) {
             }
         }
     }
+
+    if (!state->out) {
+        return true;
+    }
+
     for (int64_t tok = 0; tok < n_tokens; ++tok) {
         if (state->runtime && tok > 0 && (kind == trace_tensor_kind::topk || kind == trace_tensor_kind::candidates)) {
             const int64_t prefetch_count = std::min<int64_t>(n_expert_used, state->moevm_prefetch_topk);
@@ -2308,12 +2691,16 @@ int main(int argc, char ** argv) {
     state.moevm_test_force_pinned_fence = moevm_params.test_force_pinned_fence;
     state.moevm_inject_delay_max_us = moevm_params.inject_delay_max_us;
     state.moevm_delay_state = moevm_params.inject_delay_seed;
+    state.moevm_graph_mode_value = moevm_params.graph_mode;
+    const bool needs_cb_eval = trace_enabled;
     if (trace_enabled) {
         state.out = std::fopen(trace_out.c_str(), "w");
         if (!state.out) {
             LOG_ERR("failed to open trace output '%s': %s\n", trace_out.c_str(), std::strerror(errno));
             return 1;
         }
+    }
+    if (needs_cb_eval) {
         params.cb_eval = moe_trace_cb_eval;
         params.cb_eval_user_data = &state;
     } else {
@@ -2375,8 +2762,12 @@ int main(int argc, char ** argv) {
             ggml_backend_reset_moe_weight_copy_stats();
             ggml_backend_set_moe_weight_copy_debug(moevm_params.copy_debug);
             ggml_backend_set_moe_weight_copy_defer_input_wait(state.moevm_defer_input_wait);
-            ggml_backend_set_moe_weight_copy_callback(moevm_weight_copy_cb, &state);
-            LOG_INF("MoEVM enabled: arena=%.2fGiB inflight=%.2fMiB threads=%d prefetch_topk=%d copy_debug=%d direct_mmap=%d nocache=%d copy_mode=%s shadow_ids=%d compact_layer=%d compact_k_max=%d pool_layer=%d pool_capacity=%d resident_cache=%d defer_input_wait=%d inject_delay_us=%u test_force_pinned_fence=%d\n",
+            if (state.moevm_graph_mode_value == moevm_graph_mode::off) {
+                ggml_backend_set_moe_weight_copy_callback(moevm_weight_copy_cb, &state);
+            } else {
+                ggml_backend_set_moe_weight_copy_callback(nullptr, nullptr);
+            }
+            LOG_INF("MoEVM enabled: arena=%.2fGiB inflight=%.2fMiB threads=%d prefetch_topk=%d copy_debug=%d direct_mmap=%d nocache=%d copy_mode=%s shadow_ids=%d compact_layer=%d compact_k_max=%d pool_layer=%d pool_capacity=%d graph_mode=%s resident_cache=%d defer_input_wait=%d inject_delay_us=%u test_force_pinned_fence=%d\n",
                     moevm_params.arena_gib, moevm_params.inflight_mib, moevm_params.threads, moevm_params.prefetch_topk, moevm_params.copy_debug, moevm_params.direct_mmap ? 1 : 0,
                     moevm_params.nocache ? 1 : 0,
                     moevm_copy_mode_name(moevm_params.copy_mode),
@@ -2385,6 +2776,7 @@ int main(int argc, char ** argv) {
                     std::max(1, moevm_params.compact_k_max),
                     moevm_params.pool_layer,
                     std::max(1, moevm_params.pool_capacity),
+                    moevm_graph_mode_name(state.moevm_graph_mode_value),
                     moevm_params.resident_cache ? 1 : 0,
                     state.moevm_defer_input_wait ? 1 : 0,
                     moevm_params.inject_delay_max_us,
@@ -2397,6 +2789,53 @@ int main(int argc, char ** argv) {
             llama_backend_free();
             return 1;
         }
+    }
+    if (state.moevm_graph_mode_value == moevm_graph_mode::pool) {
+        if (!state.runtime) {
+            LOG_ERR("MoEVM graph-mode requires MoEVM runtime/index/sidecar inputs\n");
+            if (state.out) {
+                std::fclose(state.out);
+            }
+            llama_backend_free();
+            return 1;
+        }
+        if (state.moevm_pool_layer == -1) {
+            LOG_ERR("MoEVM graph-mode=pool requires --moevm-pool-layer all or a specific layer\n");
+            if (state.out) {
+                std::fclose(state.out);
+            }
+            llama_backend_free();
+            return 1;
+        }
+
+        const int32_t n_backends = llama_get_n_backends(ctx);
+        int32_t selected_backend = -1;
+        for (int32_t i = 0; i < n_backends; ++i) {
+            ggml_backend_buffer_type_t buft = llama_get_backend_buffer_type(ctx, i);
+            if (buft && !ggml_backend_buft_is_host(buft)) {
+                selected_backend = i;
+                break;
+            }
+        }
+        if (selected_backend < 0 && n_backends > 0) {
+            selected_backend = 0;
+        }
+        state.moevm_graph_backend = selected_backend >= 0 ? llama_get_backend(ctx, selected_backend) : nullptr;
+        state.moevm_graph_buft = selected_backend >= 0 ? llama_get_backend_buffer_type(ctx, selected_backend) : nullptr;
+        if (!state.moevm_graph_backend || !state.moevm_graph_buft) {
+            LOG_ERR("MoEVM graph-mode failed to select a target backend\n");
+            if (state.out) {
+                std::fclose(state.out);
+            }
+            llama_backend_free();
+            return 1;
+        }
+        llama_set_graph_transform_callback(ctx, moevm_graph_transform_cb, &state);
+        ggml_backend_set_moe_graph_pool_callback(moevm_graph_pool_sched_cb, &state);
+        LOG_INF("MoEVM graph-mode installed: mode=%s backend=%s buft=%s\n",
+                moevm_graph_mode_name(state.moevm_graph_mode_value),
+                ggml_backend_name(state.moevm_graph_backend),
+                ggml_backend_buft_name(state.moevm_graph_buft));
     }
 
     LOG_INF("%s\n", common_params_get_system_info(params).c_str());
@@ -2416,6 +2855,7 @@ int main(int argc, char ** argv) {
         }
     }
     ggml_backend_set_moe_weight_copy_callback(nullptr, nullptr);
+    ggml_backend_set_moe_graph_pool_callback(nullptr, nullptr);
     ggml_backend_set_moe_weight_copy_debug(0);
     ggml_backend_set_moe_weight_copy_defer_input_wait(false);
     if (state.runtime) {
@@ -2432,7 +2872,7 @@ int main(int argc, char ** argv) {
             runtime_error_first = state.runtime_error;
             runtime_error_last = state.runtime_error_last;
         }
-        LOG_INF("MoEVM prefetch_records=%llu copy_prefetches=%llu copy_prefetch_skips=%llu copy_hook_calls=%llu handled=%llu copied_experts=%llu copied_bytes=%llu copy_mode=%s async_ops=%llu memcpy_ops=%llu shadow_ids_attempts=%llu shadow_ids_applied=%llu shadow_ids_fallback=%llu compact_attempts=%llu compact_applied=%llu compact_fallback=%llu fallback_k_overflow=%llu pool_attempts=%llu pool_applied=%llu pool_fallback=%llu pool_component_hits=%llu pool_component_misses=%llu pool_evictions=%llu pool_fallback_shape=%llu pool_fallback_ids_read=%llu pool_fallback_alloc=%llu pool_fallback_alloc_layer=%llu pool_fallback_alloc_pool=%llu pool_fallback_alloc_pool_data=%llu pool_fallback_alloc_shadow=%llu pool_fallback_alloc_shadow_data=%llu pool_fallback_alloc_shadow_bytes=%llu pool_fallback_plan=%llu pool_fallback_remap=%llu pool_fallback_fill=%llu pool_submit_epoch=%llu pool_completed_epoch=%llu pool_epoch_drains=%llu pool_forced_fences=%llu pool_pinned_eviction_skips=%llu delay_injections=%llu delay_us=%llu resident_cache_hits=%llu resident_cache_misses=%llu resident_cache_resets=%llu runtime_errors=%llu\n",
+        LOG_INF("MoEVM prefetch_records=%llu copy_prefetches=%llu copy_prefetch_skips=%llu copy_hook_calls=%llu handled=%llu copied_experts=%llu copied_bytes=%llu copy_mode=%s async_ops=%llu memcpy_ops=%llu shadow_ids_attempts=%llu shadow_ids_applied=%llu shadow_ids_fallback=%llu compact_attempts=%llu compact_applied=%llu compact_fallback=%llu fallback_k_overflow=%llu pool_attempts=%llu pool_applied=%llu pool_fallback=%llu pool_component_hits=%llu pool_component_misses=%llu pool_evictions=%llu pool_fallback_shape=%llu pool_fallback_ids_read=%llu pool_fallback_alloc=%llu pool_fallback_alloc_layer=%llu pool_fallback_alloc_pool=%llu pool_fallback_alloc_pool_data=%llu pool_fallback_alloc_shadow=%llu pool_fallback_alloc_shadow_data=%llu pool_fallback_alloc_shadow_bytes=%llu pool_fallback_plan=%llu pool_fallback_remap=%llu pool_fallback_fill=%llu pool_submit_epoch=%llu pool_completed_epoch=%llu pool_epoch_drains=%llu pool_forced_fences=%llu pool_pinned_eviction_skips=%llu graph_patch_attempts=%llu graph_patch_applied=%llu graph_patch_fallback=%llu graph_topk_fills=%llu graph_fill_fallback=%llu delay_injections=%llu delay_us=%llu resident_cache_hits=%llu resident_cache_misses=%llu resident_cache_resets=%llu runtime_errors=%llu\n",
                 (unsigned long long) state.moevm_prefetch_records,
                 (unsigned long long) state.moevm_copy_prefetches,
                 (unsigned long long) state.moevm_copy_prefetch_skips,
@@ -2473,6 +2913,11 @@ int main(int argc, char ** argv) {
                 (unsigned long long) state.moevm_pool_epoch_drains,
                 (unsigned long long) state.moevm_pool_forced_fences,
                 (unsigned long long) state.moevm_pool_pinned_eviction_skips,
+                (unsigned long long) state.moevm_graph_patch_attempts,
+                (unsigned long long) state.moevm_graph_patch_applied,
+                (unsigned long long) state.moevm_graph_patch_fallback,
+                (unsigned long long) state.moevm_graph_topk_fills,
+                (unsigned long long) state.moevm_graph_fill_fallback,
                 (unsigned long long) state.moevm_delay_injections,
                 (unsigned long long) state.moevm_delay_us,
                 (unsigned long long) state.moevm_resident_cache_hits,
