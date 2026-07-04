@@ -11,6 +11,8 @@
 
 #import <Metal/Metal.h>
 
+#import <stdlib.h>
+
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -21,6 +23,7 @@
 
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
+    bool timing_recorded;
 };
 
 struct ggml_metal {
@@ -173,8 +176,9 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->gf = nil;
     res->encode_async = nil;
-    for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+    for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         res->cmd_bufs[i].obj = nil;
+        res->cmd_bufs[i].timing_recorded = false;
     }
 
     res->cmd_bufs_ext = [[NSMutableArray alloc] init];
@@ -189,7 +193,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
 
-    for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+    for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
             [ctx->cmd_bufs[i].obj release];
         }
@@ -232,11 +236,37 @@ void ggml_metal_free(ggml_metal_t ctx) {
     free(ctx);
 }
 
+static bool ggml_metal_moe_timestamps_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("MOEVM_METAL_TIMESTAMPS") != NULL ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+static void ggml_metal_record_moe_timing_if_completed(id<MTLCommandBuffer> cmd_buf, bool * recorded) {
+    if (!ggml_metal_moe_timestamps_enabled() || cmd_buf == nil || (recorded && *recorded)) {
+        return;
+    }
+
+    if ([cmd_buf status] != MTLCommandBufferStatusCompleted) {
+        return;
+    }
+
+    ggml_backend_moe_record_metal_command_buffer_timing([cmd_buf GPUStartTime], [cmd_buf GPUEndTime]);
+
+    if (recorded) {
+        *recorded = true;
+    }
+}
+
 const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
 void ggml_metal_synchronize(ggml_metal_t ctx) {
+    const bool record_moe_timing = ggml_metal_moe_timestamps_enabled();
+
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
         [ctx->cmd_buf_last waitUntilCompleted];
@@ -262,6 +292,10 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
                 ctx->has_error = true;
                 return;
             }
+
+            if (record_moe_timing) {
+                ggml_metal_record_moe_timing_if_completed(cmd_buf, &ctx->cmd_bufs[cb_idx].timing_recorded);
+            }
         }
     }
 
@@ -285,6 +319,10 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
 
                 ctx->has_error = true;
                 return;
+            }
+
+            if (record_moe_timing) {
+                ggml_metal_record_moe_timing_if_completed(cmd_buf, NULL);
             }
 
             [cmd_buf release];
@@ -505,6 +543,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         // short-hand
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        const bool record_moe_timing = ggml_metal_moe_timestamps_enabled();
 
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
@@ -513,9 +552,13 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             [cmd_buf retain];
 
             if (ctx->cmd_bufs[n_cb].obj) {
+                if (record_moe_timing) {
+                    ggml_metal_record_moe_timing_if_completed(ctx->cmd_bufs[n_cb].obj, &ctx->cmd_bufs[n_cb].timing_recorded);
+                }
                 [ctx->cmd_bufs[n_cb].obj release];
             }
             ctx->cmd_bufs[n_cb].obj = cmd_buf;
+            ctx->cmd_bufs[n_cb].timing_recorded = false;
 
             [cmd_buf enqueue];
 
@@ -532,9 +575,13 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             [cmd_buf retain];
 
             if (ctx->cmd_bufs[cb_idx].obj) {
+                if (record_moe_timing) {
+                    ggml_metal_record_moe_timing_if_completed(ctx->cmd_bufs[cb_idx].obj, &ctx->cmd_bufs[cb_idx].timing_recorded);
+                }
                 [ctx->cmd_bufs[cb_idx].obj release];
             }
             ctx->cmd_bufs[cb_idx].obj = cmd_buf;
+            ctx->cmd_bufs[cb_idx].timing_recorded = false;
 
             // always enqueue the first two command buffers
             // enqueue all of the command buffers if we don't need to abort

@@ -100,6 +100,9 @@ struct moe_weight_copy_atomic_stats {
     moe_stat_counter ids_readback_us;
     moe_stat_counter callback_us;
     moe_stat_counter normal_copy_us;
+    moe_stat_counter metal_cmd_buffers;
+    moe_stat_counter metal_gpu_busy_us;
+    moe_stat_counter metal_gpu_timestamp_missing;
 };
 
 static moe_weight_copy_atomic_stats g_moe_weight_copy_stats = {};
@@ -174,6 +177,9 @@ void ggml_backend_get_moe_weight_copy_stats(struct ggml_backend_moe_weight_copy_
         GGML_MOE_STAT_SNAPSHOT(ids_readback_us);
         GGML_MOE_STAT_SNAPSHOT(callback_us);
         GGML_MOE_STAT_SNAPSHOT(normal_copy_us);
+        GGML_MOE_STAT_SNAPSHOT(metal_cmd_buffers);
+        GGML_MOE_STAT_SNAPSHOT(metal_gpu_busy_us);
+        GGML_MOE_STAT_SNAPSHOT(metal_gpu_timestamp_missing);
     }
 }
 
@@ -213,6 +219,24 @@ void ggml_backend_reset_moe_weight_copy_stats(void) {
     GGML_MOE_STAT_RESET(ids_readback_us);
     GGML_MOE_STAT_RESET(callback_us);
     GGML_MOE_STAT_RESET(normal_copy_us);
+    GGML_MOE_STAT_RESET(metal_cmd_buffers);
+    GGML_MOE_STAT_RESET(metal_gpu_busy_us);
+    GGML_MOE_STAT_RESET(metal_gpu_timestamp_missing);
+}
+
+void ggml_backend_moe_record_metal_command_buffer_timing(double gpu_start_s, double gpu_end_s) {
+    if (!ggml_backend_moe_weight_copy_collect_stats()) {
+        return;
+    }
+
+    if (gpu_start_s <= 0.0 || gpu_end_s < gpu_start_s) {
+        ++g_moe_weight_copy_stats.metal_gpu_timestamp_missing;
+        return;
+    }
+
+    ++g_moe_weight_copy_stats.metal_cmd_buffers;
+    const double elapsed_us = (gpu_end_s - gpu_start_s) * 1000000.0;
+    g_moe_weight_copy_stats.metal_gpu_busy_us += (uint64_t) (elapsed_us + 0.5);
 }
 
 void ggml_backend_set_moe_weight_copy_debug(int max_lines) {

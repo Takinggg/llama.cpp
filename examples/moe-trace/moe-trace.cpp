@@ -1311,6 +1311,29 @@ static void commit_pool_slot_plan(
     }
 }
 
+static void moevm_prefetch_candidates_cached(
+        moe_trace_state * state,
+        uint32_t layer,
+        const std::vector<uint32_t> & selected) {
+    if (!state || !state->runtime || selected.empty()) {
+        return;
+    }
+
+    if (state->copy_prefetch_cache.size() <= layer) {
+        state->copy_prefetch_cache.resize((size_t) layer + 1);
+    }
+    copy_prefetch_cache_entry & cached = state->copy_prefetch_cache[layer];
+    if (cached.decode_base == state->decode_base && cached.ids == selected) {
+        ++state->moevm_copy_prefetch_skips;
+        return;
+    }
+
+    state->runtime->prefetch_candidates(layer, selected.data(), selected.size());
+    cached.decode_base = state->decode_base;
+    cached.ids = selected;
+    ++state->moevm_copy_prefetches;
+}
+
 static void moevm_inject_delay(moe_trace_state * state, uint64_t salt);
 static void maybe_force_pinned_fence_once(
         moe_trace_state * state,
@@ -1362,6 +1385,20 @@ static bool moevm_graph_fill_pool_for_topk(
     if (unique_ids.size() > (size_t) state->moevm_pool_capacity) {
         moevm_set_runtime_error(state, "MoEVM graph-mode topk union exceeds pool capacity");
         ++state->moevm_fallback_k_overflow;
+        ++state->moevm_graph_fill_fallback;
+        return false;
+    }
+    try {
+        std::vector<uint32_t> selected;
+        selected.reserve(unique_ids.size());
+        for (int32_t id : unique_ids) {
+            if (id >= 0) {
+                selected.push_back((uint32_t) id);
+            }
+        }
+        moevm_prefetch_candidates_cached(state, layer, selected);
+    } catch (const std::exception & e) {
+        moevm_set_runtime_error(state, e.what());
         ++state->moevm_graph_fill_fallback;
         return false;
     }
@@ -1866,18 +1903,7 @@ static bool moevm_weight_copy_cb(
             selected.push_back((uint32_t) expert_ids[i]);
         }
         if (!selected.empty()) {
-            if (state->copy_prefetch_cache.size() <= layer) {
-                state->copy_prefetch_cache.resize((size_t) layer + 1);
-            }
-            copy_prefetch_cache_entry & cached = state->copy_prefetch_cache[layer];
-            if (cached.decode_base == state->decode_base && cached.ids == selected) {
-                ++state->moevm_copy_prefetch_skips;
-            } else {
-                state->runtime->prefetch_candidates(layer, selected.data(), selected.size());
-                cached.decode_base = state->decode_base;
-                cached.ids = selected;
-                ++state->moevm_copy_prefetches;
-            }
+            moevm_prefetch_candidates_cached(state, layer, selected);
         }
         bool pool_done = false;
         const bool wants_pool = state->moevm_pool_layer == -2 || (state->moevm_pool_layer >= 0 && (int) layer == state->moevm_pool_layer);
@@ -2949,7 +2975,7 @@ int main(int argc, char ** argv) {
                 (unsigned long long) copy_stats.non_host_weight_inputs,
                 (unsigned long long) copy_stats.first_node_not_mul_mat_id,
                 (unsigned long long) copy_stats.src0_mismatch);
-        LOG_INF("MoEVM backend timing backend_sync_calls=%llu backend_sync_us=%llu event_sync_calls=%llu event_sync_us=%llu event_wait_calls=%llu event_wait_us=%llu graph_compute_calls=%llu graph_compute_us=%llu user_input_wait_calls=%llu user_input_wait_us=%llu split_input_wait_calls=%llu split_input_wait_us=%llu defer_input_wait_skips=%llu defer_input_wait_disabled_events=%llu moe_input_sync_calls=%llu moe_input_sync_us=%llu ids_readback_calls=%llu ids_readback_us=%llu callback_us=%llu normal_copy_us=%llu\n",
+        LOG_INF("MoEVM backend timing backend_sync_calls=%llu backend_sync_us=%llu event_sync_calls=%llu event_sync_us=%llu event_wait_calls=%llu event_wait_us=%llu graph_compute_calls=%llu graph_compute_us=%llu user_input_wait_calls=%llu user_input_wait_us=%llu split_input_wait_calls=%llu split_input_wait_us=%llu defer_input_wait_skips=%llu defer_input_wait_disabled_events=%llu moe_input_sync_calls=%llu moe_input_sync_us=%llu ids_readback_calls=%llu ids_readback_us=%llu callback_us=%llu normal_copy_us=%llu metal_cmd_buffers=%llu metal_gpu_busy_us=%llu metal_gpu_timestamp_missing=%llu\n",
                 (unsigned long long) copy_stats.backend_sync_calls,
                 (unsigned long long) copy_stats.backend_sync_us,
                 (unsigned long long) copy_stats.event_sync_calls,
@@ -2969,7 +2995,10 @@ int main(int argc, char ** argv) {
                 (unsigned long long) copy_stats.ids_readback_calls,
                 (unsigned long long) copy_stats.ids_readback_us,
                 (unsigned long long) copy_stats.callback_us,
-                (unsigned long long) copy_stats.normal_copy_us);
+                (unsigned long long) copy_stats.normal_copy_us,
+                (unsigned long long) copy_stats.metal_cmd_buffers,
+                (unsigned long long) copy_stats.metal_gpu_busy_us,
+                (unsigned long long) copy_stats.metal_gpu_timestamp_missing);
         if (!runtime_error_first.empty()) {
             LOG_WRN("MoEVM runtime warning: first=%s last=%s\n", runtime_error_first.c_str(), runtime_error_last.c_str());
         }

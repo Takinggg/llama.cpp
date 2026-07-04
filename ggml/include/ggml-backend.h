@@ -159,6 +159,9 @@ extern "C" {
         uint64_t ids_readback_us;
         uint64_t callback_us;
         uint64_t normal_copy_us;
+        uint64_t metal_cmd_buffers;
+        uint64_t metal_gpu_busy_us;
+        uint64_t metal_gpu_timestamp_missing;
     };
 
     // Diagnostic counters only. get snapshots each field independently with relaxed atomics, so
@@ -169,6 +172,7 @@ extern "C" {
     GGML_API void ggml_backend_get_moe_weight_copy_stats(struct ggml_backend_moe_weight_copy_stats * stats);
     GGML_API void ggml_backend_reset_moe_weight_copy_stats(void);
     GGML_API void ggml_backend_set_moe_weight_copy_debug(int max_lines);
+    GGML_API void ggml_backend_moe_record_metal_command_buffer_timing(double gpu_start_s, double gpu_end_s);
 
     //
     // Backend (stream)
