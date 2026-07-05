@@ -98,6 +98,14 @@ static int64_t moevm_effective_n_expert_used(
     return effective;
 }
 
+static bool moevm_active_experts_renorm_enabled() {
+    const char * env = std::getenv("MOEVM_ACTIVE_EXPERTS_RENORM");
+    if (!env || !*env) {
+        return false;
+    }
+    return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0;
+}
+
 // impl
 
 static ggml_tensor * ggml_mul_mat_aux(
@@ -1965,7 +1973,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_softmax", il);
     }
 
-    if (norm_w) {
+    const bool moevm_force_active_renorm =
+        !cparams.warmup &&
+        moevm_active_experts_renorm_enabled() &&
+        hparams.n_expert_used > 0 &&
+        n_expert_used < hparams.n_expert_used;
+
+    if (norm_w || moevm_force_active_renorm) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
 
         ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]

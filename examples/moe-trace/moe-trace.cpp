@@ -50,6 +50,7 @@ struct moevm_local_params {
     int threads = 4;
     int prefetch_topk = 10;
     int active_experts = -1;
+    bool active_experts_renorm = false;
     int copy_debug = 0;
     bool direct_mmap = false;
     bool nocache = true;
@@ -869,6 +870,14 @@ static bool parse_local_arg(
                 LOG_ERR("--moevm-active-experts must be >= 0\n");
                 return false;
             }
+            continue;
+        }
+        if (arg == "--moevm-active-experts-renorm") {
+            moevm_params.active_experts_renorm = true;
+            continue;
+        }
+        if (arg.rfind("--moevm-active-experts-renorm=", 0) == 0) {
+            moevm_params.active_experts_renorm = std::atoi(arg.substr(std::strlen("--moevm-active-experts-renorm=")).c_str()) != 0;
             continue;
         }
         if (arg == "--moevm-copy-debug") {
@@ -3194,6 +3203,11 @@ int main(int argc, char ** argv) {
             unsetenv("MOEVM_ACTIVE_EXPERTS");
         }
     }
+    if (moevm_params.active_experts_renorm) {
+        setenv("MOEVM_ACTIVE_EXPERTS_RENORM", "1", 1);
+    } else {
+        unsetenv("MOEVM_ACTIVE_EXPERTS_RENORM");
+    }
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -3255,8 +3269,8 @@ int main(int argc, char ** argv) {
             } else {
                 ggml_backend_set_moe_weight_copy_callback(nullptr, nullptr);
             }
-            LOG_INF("MoEVM enabled: arena=%.2fGiB inflight=%.2fMiB threads=%d prefetch_topk=%d active_experts=%d copy_debug=%d direct_mmap=%d nocache=%d copy_mode=%s shadow_ids=%d compact_layer=%d compact_k_max=%d pool_layer=%d pool_capacity=%d graph_mode=%s resident_cache=%d defer_input_wait=%d inject_delay_us=%u test_force_pinned_fence=%d pressure_trim=%d pressure_trim_step_gib=%.2f pressure_trim_min_gib=%.2f\n",
-                    moevm_params.arena_gib, moevm_params.inflight_mib, moevm_params.threads, moevm_params.prefetch_topk, moevm_params.active_experts, moevm_params.copy_debug, moevm_params.direct_mmap ? 1 : 0,
+            LOG_INF("MoEVM enabled: arena=%.2fGiB inflight=%.2fMiB threads=%d prefetch_topk=%d active_experts=%d active_experts_renorm=%d copy_debug=%d direct_mmap=%d nocache=%d copy_mode=%s shadow_ids=%d compact_layer=%d compact_k_max=%d pool_layer=%d pool_capacity=%d graph_mode=%s resident_cache=%d defer_input_wait=%d inject_delay_us=%u test_force_pinned_fence=%d pressure_trim=%d pressure_trim_step_gib=%.2f pressure_trim_min_gib=%.2f\n",
+                    moevm_params.arena_gib, moevm_params.inflight_mib, moevm_params.threads, moevm_params.prefetch_topk, moevm_params.active_experts, moevm_params.active_experts_renorm ? 1 : 0, moevm_params.copy_debug, moevm_params.direct_mmap ? 1 : 0,
                     moevm_params.nocache ? 1 : 0,
                     moevm_copy_mode_name(moevm_params.copy_mode),
                     moevm_params.shadow_ids ? 1 : 0,
