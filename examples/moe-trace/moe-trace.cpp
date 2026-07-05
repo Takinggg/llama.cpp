@@ -354,6 +354,150 @@ struct moe_trace_state {
     }
 };
 
+struct moevm_phase_snapshot {
+    ggml_backend_moe_weight_copy_stats backend = {};
+    moevm::RuntimeMetrics runtime = {};
+    int64_t t_us = 0;
+};
+
+static uint64_t moevm_diff_u64(uint64_t after, uint64_t before) {
+    return after >= before ? after - before : 0;
+}
+
+static double moevm_diff_double(double after, double before) {
+    return after >= before ? after - before : 0.0;
+}
+
+static moevm_phase_snapshot moevm_take_phase_snapshot(const moe_trace_state & state) {
+    moevm_phase_snapshot out;
+    out.t_us = ggml_time_us();
+    ggml_backend_get_moe_weight_copy_stats(&out.backend);
+    if (state.runtime) {
+        out.runtime = state.runtime->metrics();
+    }
+    return out;
+}
+
+static ggml_backend_moe_weight_copy_stats moevm_backend_delta(
+        const ggml_backend_moe_weight_copy_stats & after,
+        const ggml_backend_moe_weight_copy_stats & before) {
+    ggml_backend_moe_weight_copy_stats out = {};
+    out.split_inputs = moevm_diff_u64(after.split_inputs, before.split_inputs);
+    out.user_inputs = moevm_diff_u64(after.user_inputs, before.user_inputs);
+    out.graph_empty = moevm_diff_u64(after.graph_empty, before.graph_empty);
+    out.non_weight_inputs = moevm_diff_u64(after.non_weight_inputs, before.non_weight_inputs);
+    out.non_host_weight_inputs = moevm_diff_u64(after.non_host_weight_inputs, before.non_host_weight_inputs);
+    out.first_node_not_mul_mat_id = moevm_diff_u64(after.first_node_not_mul_mat_id, before.first_node_not_mul_mat_id);
+    out.src0_mismatch = moevm_diff_u64(after.src0_mismatch, before.src0_mismatch);
+    out.eligible = moevm_diff_u64(after.eligible, before.eligible);
+    out.ids_refreshes = moevm_diff_u64(after.ids_refreshes, before.ids_refreshes);
+    out.callback_attempts = moevm_diff_u64(after.callback_attempts, before.callback_attempts);
+    out.callback_handled = moevm_diff_u64(after.callback_handled, before.callback_handled);
+    out.callback_fallback = moevm_diff_u64(after.callback_fallback, before.callback_fallback);
+    out.graph_patches = moevm_diff_u64(after.graph_patches, before.graph_patches);
+    out.graph_patch_restores = moevm_diff_u64(after.graph_patch_restores, before.graph_patch_restores);
+    out.normal_copy_fallback = moevm_diff_u64(after.normal_copy_fallback, before.normal_copy_fallback);
+    out.backend_sync_calls = moevm_diff_u64(after.backend_sync_calls, before.backend_sync_calls);
+    out.backend_sync_us = moevm_diff_u64(after.backend_sync_us, before.backend_sync_us);
+    out.event_sync_calls = moevm_diff_u64(after.event_sync_calls, before.event_sync_calls);
+    out.event_sync_us = moevm_diff_u64(after.event_sync_us, before.event_sync_us);
+    out.event_wait_calls = moevm_diff_u64(after.event_wait_calls, before.event_wait_calls);
+    out.event_wait_us = moevm_diff_u64(after.event_wait_us, before.event_wait_us);
+    out.graph_compute_calls = moevm_diff_u64(after.graph_compute_calls, before.graph_compute_calls);
+    out.graph_compute_us = moevm_diff_u64(after.graph_compute_us, before.graph_compute_us);
+    out.user_input_wait_calls = moevm_diff_u64(after.user_input_wait_calls, before.user_input_wait_calls);
+    out.user_input_wait_us = moevm_diff_u64(after.user_input_wait_us, before.user_input_wait_us);
+    out.split_input_wait_calls = moevm_diff_u64(after.split_input_wait_calls, before.split_input_wait_calls);
+    out.split_input_wait_us = moevm_diff_u64(after.split_input_wait_us, before.split_input_wait_us);
+    out.defer_input_wait_skips = moevm_diff_u64(after.defer_input_wait_skips, before.defer_input_wait_skips);
+    out.defer_input_wait_disabled_events = moevm_diff_u64(after.defer_input_wait_disabled_events, before.defer_input_wait_disabled_events);
+    out.moe_input_sync_calls = moevm_diff_u64(after.moe_input_sync_calls, before.moe_input_sync_calls);
+    out.moe_input_sync_us = moevm_diff_u64(after.moe_input_sync_us, before.moe_input_sync_us);
+    out.ids_readback_calls = moevm_diff_u64(after.ids_readback_calls, before.ids_readback_calls);
+    out.ids_readback_us = moevm_diff_u64(after.ids_readback_us, before.ids_readback_us);
+    out.callback_us = moevm_diff_u64(after.callback_us, before.callback_us);
+    out.normal_copy_us = moevm_diff_u64(after.normal_copy_us, before.normal_copy_us);
+    out.metal_cmd_buffers = moevm_diff_u64(after.metal_cmd_buffers, before.metal_cmd_buffers);
+    out.metal_gpu_busy_us = moevm_diff_u64(after.metal_gpu_busy_us, before.metal_gpu_busy_us);
+    out.metal_gpu_timestamp_missing = moevm_diff_u64(after.metal_gpu_timestamp_missing, before.metal_gpu_timestamp_missing);
+    return out;
+}
+
+static moevm::RuntimeMetrics moevm_runtime_delta(
+        const moevm::RuntimeMetrics & after,
+        const moevm::RuntimeMetrics & before) {
+    moevm::RuntimeMetrics out = {};
+    out.prefetch_enqueued = moevm_diff_u64(after.prefetch_enqueued, before.prefetch_enqueued);
+    out.prefetch_dropped = moevm_diff_u64(after.prefetch_dropped, before.prefetch_dropped);
+    out.prefetch_deduped = moevm_diff_u64(after.prefetch_deduped, before.prefetch_deduped);
+    out.prefetch_completed = moevm_diff_u64(after.prefetch_completed, before.prefetch_completed);
+    out.prefetch_read_ops = moevm_diff_u64(after.prefetch_read_ops, before.prefetch_read_ops);
+    out.prefetch_read_bytes = moevm_diff_u64(after.prefetch_read_bytes, before.prefetch_read_bytes);
+    out.prefetch_waits = moevm_diff_u64(after.prefetch_waits, before.prefetch_waits);
+    out.prefetch_wait_s = moevm_diff_double(after.prefetch_wait_s, before.prefetch_wait_s);
+    out.demand_read_ops = moevm_diff_u64(after.demand_read_ops, before.demand_read_ops);
+    out.demand_read_bytes = moevm_diff_u64(after.demand_read_bytes, before.demand_read_bytes);
+    out.hits = moevm_diff_u64(after.hits, before.hits);
+    out.misses = moevm_diff_u64(after.misses, before.misses);
+    out.evictions = moevm_diff_u64(after.evictions, before.evictions);
+    out.arena_used_bytes = after.arena_used_bytes;
+    out.arena_high_water_bytes = after.arena_high_water_bytes;
+    out.arena_resident_records = after.arena_resident_records;
+    out.arena_free_spans = after.arena_free_spans;
+    out.arena_largest_free_span_bytes = after.arena_largest_free_span_bytes;
+    out.arena_reclaim_advises = moevm_diff_u64(after.arena_reclaim_advises, before.arena_reclaim_advises);
+    out.arena_reclaim_bytes = moevm_diff_u64(after.arena_reclaim_bytes, before.arena_reclaim_bytes);
+    out.arena_reclaim_live_bytes = after.arena_reclaim_live_bytes;
+    out.arena_reuse_advises = moevm_diff_u64(after.arena_reuse_advises, before.arena_reuse_advises);
+    out.arena_reuse_bytes = moevm_diff_u64(after.arena_reuse_bytes, before.arena_reuse_bytes);
+    out.delay_injections = moevm_diff_u64(after.delay_injections, before.delay_injections);
+    out.delay_us = moevm_diff_u64(after.delay_us, before.delay_us);
+    return out;
+}
+
+static void moevm_log_phase_delta(
+        const char * label,
+        const moevm_phase_snapshot & before,
+        const moevm_phase_snapshot & after) {
+    const ggml_backend_moe_weight_copy_stats b = moevm_backend_delta(after.backend, before.backend);
+    const moevm::RuntimeMetrics r = moevm_runtime_delta(after.runtime, before.runtime);
+    const uint64_t elapsed_us = moevm_diff_u64((uint64_t) after.t_us, (uint64_t) before.t_us);
+
+    LOG_INF("MoEVM phase %s runtime elapsed_us=%llu demand_reads=%llu prefetch_reads=%llu waits=%llu wait_s=%.6f evictions=%llu hits=%llu misses=%llu arena_used=%.2fGiB high_water=%.2fGiB reclaim=%.2fGiB reuse=%.2fGiB\n",
+            label,
+            (unsigned long long) elapsed_us,
+            (unsigned long long) r.demand_read_ops,
+            (unsigned long long) r.prefetch_read_ops,
+            (unsigned long long) r.prefetch_waits,
+            r.prefetch_wait_s,
+            (unsigned long long) r.evictions,
+            (unsigned long long) r.hits,
+            (unsigned long long) r.misses,
+            (double) r.arena_used_bytes / 1024.0 / 1024.0 / 1024.0,
+            (double) r.arena_high_water_bytes / 1024.0 / 1024.0 / 1024.0,
+            (double) r.arena_reclaim_bytes / 1024.0 / 1024.0 / 1024.0,
+            (double) r.arena_reuse_bytes / 1024.0 / 1024.0 / 1024.0);
+    LOG_INF("MoEVM phase %s backend split_inputs=%llu user_inputs=%llu ids_refreshes=%llu attempts=%llu handled=%llu graph_patches=%llu graph_patch_restores=%llu backend_sync_calls=%llu backend_sync_us=%llu graph_compute_calls=%llu graph_compute_us=%llu ids_readback_calls=%llu ids_readback_us=%llu callback_us=%llu metal_cmd_buffers=%llu metal_gpu_busy_us=%llu metal_gpu_timestamp_missing=%llu\n",
+            label,
+            (unsigned long long) b.split_inputs,
+            (unsigned long long) b.user_inputs,
+            (unsigned long long) b.ids_refreshes,
+            (unsigned long long) b.callback_attempts,
+            (unsigned long long) b.callback_handled,
+            (unsigned long long) b.graph_patches,
+            (unsigned long long) b.graph_patch_restores,
+            (unsigned long long) b.backend_sync_calls,
+            (unsigned long long) b.backend_sync_us,
+            (unsigned long long) b.graph_compute_calls,
+            (unsigned long long) b.graph_compute_us,
+            (unsigned long long) b.ids_readback_calls,
+            (unsigned long long) b.ids_readback_us,
+            (unsigned long long) b.callback_us,
+            (unsigned long long) b.metal_cmd_buffers,
+            (unsigned long long) b.metal_gpu_busy_us,
+            (unsigned long long) b.metal_gpu_timestamp_missing);
+}
+
 static void moevm_set_runtime_error(moe_trace_state * state, const std::string & message) {
     if (!state) {
         return;
@@ -2527,6 +2671,7 @@ static bool run_trace(llama_context * ctx, const common_params & params, moe_tra
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
     int64_t n_past = 0;
     const std::vector<llama_seq_id> seq_ids{0};
+    const moevm_phase_snapshot phase_start = moevm_take_phase_snapshot(state);
 
     while (n_past < (int64_t) tokens.size()) {
         common_batch_clear(batch);
@@ -2546,6 +2691,8 @@ static bool run_trace(llama_context * ctx, const common_params & params, moe_tra
         LOG_INF("traced %lld / %zu prompt tokens, records=%lld\n",
                 (long long) n_past, tokens.size(), (long long) state.records);
     }
+    const moevm_phase_snapshot phase_after_prefill = moevm_take_phase_snapshot(state);
+    moevm_log_phase_delta("prefill", phase_start, phase_after_prefill);
 
     if (n_predict > 0) {
         llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
@@ -2598,6 +2745,8 @@ static bool run_trace(llama_context * ctx, const common_params & params, moe_tra
         LOG_INF("%s\n", token_ids.c_str());
         llama_sampler_free(sampler);
     }
+    const moevm_phase_snapshot phase_after_decode = moevm_take_phase_snapshot(state);
+    moevm_log_phase_delta("decode", phase_after_prefill, phase_after_decode);
 
     llama_batch_free(batch);
     return true;
