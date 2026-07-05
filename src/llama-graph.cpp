@@ -14,7 +14,9 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -59,6 +61,41 @@ static bool can_reuse_kq_mask(
     res &= (kq_mask->ne[3] == n_stream);
 
     return res;
+}
+
+static int64_t moevm_effective_n_expert_used(
+        const llama_hparams & hparams,
+        const llama_cparams & cparams) {
+    const int64_t base = cparams.warmup ? hparams.n_expert : hparams.n_expert_used;
+    const char * env = std::getenv("MOEVM_ACTIVE_EXPERTS");
+    if (!env || !*env) {
+        return base;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long requested = std::strtol(env, &end, 10);
+    if (errno || end == env || *end != '\0' || requested <= 0) {
+        static bool warned = false;
+        if (!warned) {
+            LLAMA_LOG_WARN("%s: ignoring invalid MOEVM_ACTIVE_EXPERTS='%s'\n", __func__, env);
+            warned = true;
+        }
+        return base;
+    }
+
+    if (cparams.warmup) {
+        return base;
+    }
+
+    const int64_t effective = std::max<int64_t>(1, std::min<int64_t>(base, requested));
+    static int64_t last_logged = -1;
+    if (last_logged != effective) {
+        LLAMA_LOG_INFO("%s: MOEVM_ACTIVE_EXPERTS=%ld active=%lld / base=%lld\n",
+                __func__, requested, (long long) effective, (long long) base);
+        last_logged = effective;
+    }
+    return effective;
 }
 
 // impl
@@ -1330,7 +1367,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_embd_head_v    (hparams.n_embd_head_v()),
     n_embd_v_gqa     (hparams.n_embd_v_gqa()),
     n_expert         (hparams.n_expert),
-    n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used),
+    n_expert_used    (moevm_effective_n_expert_used(params.hparams, params.cparams)),
     freq_base        (cparams.rope_freq_base),
     freq_scale       (cparams.rope_freq_scale),
     ext_factor       (cparams.yarn_ext_factor),
@@ -2110,25 +2147,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     assert(n_expert_used > 0);
 
     // order the views before the adds
-    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+    for (int64_t i = 0; i < n_expert_used; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
         ggml_build_forward_expand(gf, cur_experts[i]);
     }
 
     // aggregate experts
-    // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
-    //       to avoid potentially a large number of add nodes during warmup
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
+    // n_expert_used may be reduced by MOEVM_ACTIVE_EXPERTS. Warmup still uses
+    // all experts via llm_graph_context::n_expert_used.
     ggml_tensor * moe_out = cur_experts[0];
 
-    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+    for (int64_t i = 1; i < n_expert_used; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
 
         ggml_build_forward_expand(gf, moe_out);
     }
 
-    if (hparams.n_expert_used == 1) {
+    if (n_expert_used == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
     }

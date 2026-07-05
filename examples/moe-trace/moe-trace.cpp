@@ -49,6 +49,7 @@ struct moevm_local_params {
     double inflight_mib = 64.0;
     int threads = 4;
     int prefetch_topk = 10;
+    int active_experts = -1;
     int copy_debug = 0;
     bool direct_mmap = false;
     bool nocache = true;
@@ -848,6 +849,26 @@ static bool parse_local_arg(
         }
         if (arg.rfind("--moevm-prefetch-topk=", 0) == 0) {
             moevm_params.prefetch_topk = std::atoi(arg.substr(std::strlen("--moevm-prefetch-topk=")).c_str());
+            continue;
+        }
+        if (arg == "--moevm-active-experts") {
+            if (i + 1 >= argc) {
+                LOG_ERR("--moevm-active-experts requires an integer, or 0 to disable\n");
+                return false;
+            }
+            moevm_params.active_experts = std::atoi(argv[++i]);
+            if (moevm_params.active_experts < 0) {
+                LOG_ERR("--moevm-active-experts must be >= 0\n");
+                return false;
+            }
+            continue;
+        }
+        if (arg.rfind("--moevm-active-experts=", 0) == 0) {
+            moevm_params.active_experts = std::atoi(arg.substr(std::strlen("--moevm-active-experts=")).c_str());
+            if (moevm_params.active_experts < 0) {
+                LOG_ERR("--moevm-active-experts must be >= 0\n");
+                return false;
+            }
             continue;
         }
         if (arg == "--moevm-copy-debug") {
@@ -2827,6 +2848,22 @@ static bool run_speculative_trace(llama_context * ctx_tgt, common_params params,
     int n_predict = 0;
     int n_drafted = 0;
     int n_accept  = 0;
+    int n_spec_loops = 0;
+    int n_spec_empty_drafts = 0;
+    int n_spec_partial_rejects = 0;
+    uint64_t spec_prompt_target_decode_us = 0;
+    uint64_t spec_prompt_process_us = 0;
+    uint64_t spec_draft_us = 0;
+    uint64_t spec_target_decode_us = 0;
+    uint64_t spec_process_us = 0;
+    uint64_t spec_ckpt_tgt_save_us = 0;
+    uint64_t spec_ckpt_tgt_load_us = 0;
+    uint64_t spec_ckpt_dft_save_us = 0;
+    uint64_t spec_ckpt_dft_load_us = 0;
+    uint64_t spec_sampler_clone_us = 0;
+    uint64_t spec_sample_us = 0;
+    uint64_t spec_accept_us = 0;
+    uint64_t spec_seq_rm_us = 0;
     bool has_eos = false;
     llama_seq_id seq_id = 0;
 
@@ -2844,18 +2881,22 @@ static bool run_speculative_trace(llama_context * ctx_tgt, common_params params,
             common_batch_add(batch_tgt, inp[(size_t) i], (llama_pos) i, { seq_id }, false);
         }
         moevm_prepare_decode_state(state, 0, n_prompt_eval);
+        const int64_t t_prompt_target_decode_us = ggml_time_us();
         if (llama_decode(ctx_tgt, batch_tgt) != 0) {
             LOG_ERR("%s: target prompt decode failed\n", __func__);
             common_speculative_free(spec);
             llama_batch_free(batch_tgt);
             return false;
         }
+        spec_prompt_target_decode_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_prompt_target_decode_us);
+        const int64_t t_prompt_process_us = ggml_time_us();
         if (!common_speculative_process(spec, batch_tgt)) {
             LOG_ERR("%s: speculative prompt process failed\n", __func__);
             common_speculative_free(spec);
             llama_batch_free(batch_tgt);
             return false;
         }
+        spec_prompt_process_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_prompt_process_us);
     }
 
     llama_token id_last = inp.back();
@@ -2875,6 +2916,7 @@ static bool run_speculative_trace(llama_context * ctx_tgt, common_params params,
     const int64_t t_dec_start = ggml_time_us();
 
     while (true) {
+        ++n_spec_loops;
         if (draft.empty()) {
             ckpt.update_pos(
                     prompt_tgt.size(),
@@ -2882,7 +2924,9 @@ static bool run_speculative_trace(llama_context * ctx_tgt, common_params params,
                     llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq_id));
 
             if (use_ckpt_dft) {
+                const int64_t t_ckpt_dft_save_us = ggml_time_us();
                 ckpt.update_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                spec_ckpt_dft_save_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_ckpt_dft_save_us);
             }
 
             common_speculative_get_draft_params(spec, seq_id) = {
@@ -2893,15 +2937,26 @@ static bool run_speculative_trace(llama_context * ctx_tgt, common_params params,
                 /* .prompt     = */ &prompt_tgt,
                 /* .result     = */ &draft,
             };
+            const int64_t t_draft_us = ggml_time_us();
             common_speculative_draft(spec);
+            spec_draft_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_draft_us);
             n_draft = draft.size();
-
-            if (!draft.empty() && use_ckpt_tgt) {
-                ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (draft.empty()) {
+                ++n_spec_empty_drafts;
             }
 
+            if (!draft.empty() && use_ckpt_tgt) {
+                const int64_t t_ckpt_tgt_save_us = ggml_time_us();
+                ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                spec_ckpt_tgt_save_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_ckpt_tgt_save_us);
+            }
+
+            const int64_t t_ckpt_dft_load_us = ggml_time_us();
             ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            spec_ckpt_dft_load_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_ckpt_dft_load_us);
+            const int64_t t_seq_rm_us = ggml_time_us();
             llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1);
+            spec_seq_rm_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_seq_rm_us);
         } else if (use_ckpt_tgt) {
             GGML_ASSERT(!ckpt.empty());
         }
@@ -2914,36 +2969,53 @@ static bool run_speculative_trace(llama_context * ctx_tgt, common_params params,
         }
 
         moevm_prepare_decode_state(state, target_decode_base, batch_tgt.n_tokens);
+        const int64_t t_target_decode_us = ggml_time_us();
         if (llama_decode(ctx_tgt, batch_tgt) != 0) {
             LOG_ERR("%s: target speculative decode failed at token offset %d\n", __func__, target_decode_base);
             common_speculative_free(spec);
             llama_batch_free(batch_tgt);
             return false;
         }
+        spec_target_decode_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_target_decode_us);
 
+        const int64_t t_process_us = ggml_time_us();
         if (!common_speculative_process(spec, batch_tgt)) {
             LOG_ERR("%s: speculative process failed at token offset %d\n", __func__, target_decode_base);
             common_speculative_free(spec);
             llama_batch_free(batch_tgt);
             return false;
         }
+        spec_process_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_process_us);
 
         common_sampler_ptr smpl_save;
         if (use_ckpt_tgt) {
+            const int64_t t_sampler_clone_us = ggml_time_us();
             smpl_save.reset(common_sampler_clone(smpl.get()));
+            spec_sampler_clone_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_sampler_clone_us);
         }
 
+        const int64_t t_sample_us = ggml_time_us();
         auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
+        spec_sample_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_sample_us);
         GGML_ASSERT(ids.size() > 0);
 
         if (use_ckpt_tgt && ids.size() - 1 < draft.size()) {
+            ++n_spec_partial_rejects;
             draft = std::move(ids);
 
+            const int64_t t_ckpt_tgt_load_us = ggml_time_us();
             ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            spec_ckpt_tgt_load_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_ckpt_tgt_load_us);
+            const int64_t t_seq_rm_tgt_us = ggml_time_us();
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, ckpt.pos_max + 1, -1);
+            spec_seq_rm_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_seq_rm_tgt_us);
 
+            const int64_t t_ckpt_dft_load_us = ggml_time_us();
             ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            spec_ckpt_dft_load_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_ckpt_dft_load_us);
+            const int64_t t_seq_rm_dft_us = ggml_time_us();
             llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1);
+            spec_seq_rm_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_seq_rm_dft_us);
 
             prompt_tgt.resize(ckpt.n_tokens);
             smpl = std::move(smpl_save);
@@ -2952,7 +3024,9 @@ static bool run_speculative_trace(llama_context * ctx_tgt, common_params params,
         }
 
         if (n_draft > 0) {
+            const int64_t t_accept_us = ggml_time_us();
             common_speculative_accept(spec, seq_id, ids.size() - 1);
+            spec_accept_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_accept_us);
         }
 
         n_past    += ids.size() - 1;
@@ -2976,8 +3050,10 @@ static bool run_speculative_trace(llama_context * ctx_tgt, common_params params,
 
         draft.clear();
 
+        const int64_t t_seq_rm_tail_us = ggml_time_us();
         llama_memory_seq_rm(llama_get_memory(ctx_tgt),       seq_id, n_past, -1);
         llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, n_past, -1);
+        spec_seq_rm_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_seq_rm_tail_us);
 
         if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
             break;
@@ -3000,6 +3076,23 @@ static bool run_speculative_trace(llama_context * ctx_tgt, common_params params,
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
     LOG_INF("accept    = %.3f%%\n", n_drafted > 0 ? 100.0f * n_accept / n_drafted : 0.0f);
+    LOG_INF("MoEVM speculative timings loops=%d empty_drafts=%d partial_rejects=%d prompt_target_decode_us=%llu prompt_process_us=%llu draft_us=%llu target_decode_us=%llu process_us=%llu ckpt_tgt_save_us=%llu ckpt_tgt_load_us=%llu ckpt_dft_save_us=%llu ckpt_dft_load_us=%llu sampler_clone_us=%llu sample_us=%llu accept_us=%llu seq_rm_us=%llu\n",
+            n_spec_loops,
+            n_spec_empty_drafts,
+            n_spec_partial_rejects,
+            (unsigned long long) spec_prompt_target_decode_us,
+            (unsigned long long) spec_prompt_process_us,
+            (unsigned long long) spec_draft_us,
+            (unsigned long long) spec_target_decode_us,
+            (unsigned long long) spec_process_us,
+            (unsigned long long) spec_ckpt_tgt_save_us,
+            (unsigned long long) spec_ckpt_tgt_load_us,
+            (unsigned long long) spec_ckpt_dft_save_us,
+            (unsigned long long) spec_ckpt_dft_load_us,
+            (unsigned long long) spec_sampler_clone_us,
+            (unsigned long long) spec_sample_us,
+            (unsigned long long) spec_accept_us,
+            (unsigned long long) spec_seq_rm_us);
 
     std::string token_ids = "generated_token_ids=[";
     for (size_t i = 0; i < state.generated_tokens.size(); ++i) {
@@ -3093,6 +3186,14 @@ int main(int argc, char ** argv) {
         LOG_INF("MoE trace disabled: running without cb_eval/readback tracing\n");
     }
     params.warmup = false;
+    if (moevm_params.active_experts >= 0) {
+        if (moevm_params.active_experts > 0) {
+            const std::string value = std::to_string(moevm_params.active_experts);
+            setenv("MOEVM_ACTIVE_EXPERTS", value.c_str(), 1);
+        } else {
+            unsetenv("MOEVM_ACTIVE_EXPERTS");
+        }
+    }
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -3154,8 +3255,8 @@ int main(int argc, char ** argv) {
             } else {
                 ggml_backend_set_moe_weight_copy_callback(nullptr, nullptr);
             }
-            LOG_INF("MoEVM enabled: arena=%.2fGiB inflight=%.2fMiB threads=%d prefetch_topk=%d copy_debug=%d direct_mmap=%d nocache=%d copy_mode=%s shadow_ids=%d compact_layer=%d compact_k_max=%d pool_layer=%d pool_capacity=%d graph_mode=%s resident_cache=%d defer_input_wait=%d inject_delay_us=%u test_force_pinned_fence=%d pressure_trim=%d pressure_trim_step_gib=%.2f pressure_trim_min_gib=%.2f\n",
-                    moevm_params.arena_gib, moevm_params.inflight_mib, moevm_params.threads, moevm_params.prefetch_topk, moevm_params.copy_debug, moevm_params.direct_mmap ? 1 : 0,
+            LOG_INF("MoEVM enabled: arena=%.2fGiB inflight=%.2fMiB threads=%d prefetch_topk=%d active_experts=%d copy_debug=%d direct_mmap=%d nocache=%d copy_mode=%s shadow_ids=%d compact_layer=%d compact_k_max=%d pool_layer=%d pool_capacity=%d graph_mode=%s resident_cache=%d defer_input_wait=%d inject_delay_us=%u test_force_pinned_fence=%d pressure_trim=%d pressure_trim_step_gib=%.2f pressure_trim_min_gib=%.2f\n",
+                    moevm_params.arena_gib, moevm_params.inflight_mib, moevm_params.threads, moevm_params.prefetch_topk, moevm_params.active_experts, moevm_params.copy_debug, moevm_params.direct_mmap ? 1 : 0,
                     moevm_params.nocache ? 1 : 0,
                     moevm_copy_mode_name(moevm_params.copy_mode),
                     moevm_params.shadow_ids ? 1 : 0,
