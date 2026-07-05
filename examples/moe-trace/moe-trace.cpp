@@ -25,6 +25,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -72,6 +73,7 @@ struct moevm_local_params {
     double pressure_trim_min_gib = 8.0;
     uint32_t inject_delay_max_us = 0;
     uint64_t inject_delay_seed = 0x9e3779b97f4a7c15ull;
+    int parallel_seqs = 1;
     moevm_copy_mode copy_mode = moevm_copy_mode::async;
     moevm_graph_mode graph_mode = moevm_graph_mode::off;
 };
@@ -174,6 +176,17 @@ struct moe_trace_state {
     std::vector<pool_weight_slot> pool_weight_slots;
     std::vector<layer_pool_state> layer_pools;
     std::vector<resident_weight_cache_slot> resident_weight_cache_slots;
+    std::vector<std::vector<size_t>> graph_pool_component_slot_indices_by_layer;
+    std::unordered_map<const ggml_tensor *, size_t> graph_pool_tensor_slot_index;
+    size_t graph_pool_slot_cache_size = 0;
+    std::vector<uint8_t> graph_pool_used_ids_scratch;
+    std::vector<int32_t> graph_pool_unique_ids_scratch;
+    std::vector<uint32_t> graph_pool_selected_scratch;
+    std::vector<int32_t> graph_pool_remap_scratch;
+    std::vector<int32_t> graph_pool_shadow_ids_scratch;
+    std::vector<std::pair<size_t, int32_t>> graph_pool_touched_slots_scratch;
+    pool_slot_plan graph_pool_plan_scratch;
+    std::vector<uint8_t> graph_pool_protected_slot_scratch;
     std::unique_ptr<moevm::Runtime> runtime;
     std::mutex runtime_error_mu;
     std::string runtime_error;
@@ -260,6 +273,7 @@ struct moe_trace_state {
     bool moevm_test_force_pinned_fence = false;
     bool moevm_test_force_pinned_fence_done = false;
     uint32_t moevm_inject_delay_max_us = 0;
+    int moevm_parallel_seqs = 1;
     moevm_copy_mode moevm_copy_mode_value = moevm_copy_mode::async;
     moevm_graph_mode moevm_graph_mode_value = moevm_graph_mode::off;
     ggml_backend_t moevm_graph_backend = nullptr;
@@ -358,6 +372,17 @@ struct moe_trace_state {
         pool_weight_slots.clear();
         layer_pools.clear();
         resident_weight_cache_slots.clear();
+        graph_pool_component_slot_indices_by_layer.clear();
+        graph_pool_tensor_slot_index.clear();
+        graph_pool_slot_cache_size = 0;
+        graph_pool_used_ids_scratch.clear();
+        graph_pool_unique_ids_scratch.clear();
+        graph_pool_selected_scratch.clear();
+        graph_pool_remap_scratch.clear();
+        graph_pool_shadow_ids_scratch.clear();
+        graph_pool_touched_slots_scratch.clear();
+        graph_pool_plan_scratch = {};
+        graph_pool_protected_slot_scratch.clear();
     }
 };
 
@@ -1049,6 +1074,18 @@ static bool parse_local_arg(
             moevm_params.speculative = std::atoi(arg.substr(std::strlen("--moevm-speculative=")).c_str()) != 0;
             continue;
         }
+        if (arg == "--moevm-parallel-seqs") {
+            if (i + 1 >= argc) {
+                LOG_ERR("--moevm-parallel-seqs requires an integer\n");
+                return false;
+            }
+            moevm_params.parallel_seqs = std::max(1, std::atoi(argv[++i]));
+            continue;
+        }
+        if (arg.rfind("--moevm-parallel-seqs=", 0) == 0) {
+            moevm_params.parallel_seqs = std::max(1, std::atoi(arg.substr(std::strlen("--moevm-parallel-seqs=")).c_str()));
+            continue;
+        }
         if (arg == "--moevm-inject-delay-us") {
             if (i + 1 >= argc) {
                 LOG_ERR("--moevm-inject-delay-us requires an integer\n");
@@ -1527,13 +1564,59 @@ static layer_pool_state * get_or_create_layer_pool(
     return &state->layer_pools.back();
 }
 
+static void moevm_graph_rebuild_pool_slot_cache(moe_trace_state * state) {
+    if (!state || state->graph_pool_slot_cache_size == state->pool_weight_slots.size()) {
+        return;
+    }
+
+    state->graph_pool_component_slot_indices_by_layer.clear();
+    state->graph_pool_tensor_slot_index.clear();
+    for (size_t i = 0; i < state->pool_weight_slots.size(); ++i) {
+        const pool_weight_slot & slot = state->pool_weight_slots[i];
+        if (slot.backend != state->moevm_graph_backend ||
+                slot.buft != state->moevm_graph_buft ||
+                slot.src_tensor == nullptr ||
+                slot.tensor == nullptr) {
+            continue;
+        }
+        if (state->graph_pool_component_slot_indices_by_layer.size() <= slot.layer) {
+            state->graph_pool_component_slot_indices_by_layer.resize((size_t) slot.layer + 1);
+        }
+        state->graph_pool_component_slot_indices_by_layer[(size_t) slot.layer].push_back(i);
+        state->graph_pool_tensor_slot_index[slot.tensor] = i;
+    }
+    state->graph_pool_slot_cache_size = state->pool_weight_slots.size();
+}
+
+static const std::vector<size_t> & moevm_graph_pool_component_slot_indices(moe_trace_state * state, uint32_t layer) {
+    static const std::vector<size_t> empty;
+    moevm_graph_rebuild_pool_slot_cache(state);
+    if (!state || layer >= state->graph_pool_component_slot_indices_by_layer.size()) {
+        return empty;
+    }
+    return state->graph_pool_component_slot_indices_by_layer[(size_t) layer];
+}
+
+static pool_weight_slot * moevm_graph_pool_slot_for_tensor(moe_trace_state * state, const ggml_tensor * tensor) {
+    if (!state || !tensor) {
+        return nullptr;
+    }
+    moevm_graph_rebuild_pool_slot_cache(state);
+    const auto it = state->graph_pool_tensor_slot_index.find(tensor);
+    if (it == state->graph_pool_tensor_slot_index.end() || it->second >= state->pool_weight_slots.size()) {
+        return nullptr;
+    }
+    return &state->pool_weight_slots[it->second];
+}
+
 static bool collect_unique_i32_ids(
         const ggml_tensor * ids_tensor,
         const int32_t * ids_data,
         size_t ids_data_count,
         int64_t n_expert,
         std::vector<int32_t> & unique_ids,
-        std::string * error = nullptr) {
+        std::string * error = nullptr,
+        std::vector<uint8_t> * used_ids_scratch = nullptr) {
     if (!ids_tensor || !ids_data || ids_tensor->type != GGML_TYPE_I32 || n_expert <= 0) {
         if (error) {
             *error = "invalid tensor/type/expert count";
@@ -1542,7 +1625,9 @@ static bool collect_unique_i32_ids(
     }
     (void) ids_data_count;
 
-    std::vector<uint8_t> used_ids((size_t) n_expert, 0);
+    std::vector<uint8_t> used_ids_local;
+    std::vector<uint8_t> & used_ids = used_ids_scratch ? *used_ids_scratch : used_ids_local;
+    used_ids.assign((size_t) n_expert, 0);
     unique_ids.clear();
     for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; ++i1) {
         for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; ++i0) {
@@ -1584,7 +1669,8 @@ static bool plan_pool_slots(
         const int32_t * expert_ids,
         size_t expert_id_count,
         pool_slot_plan & plan,
-        bool & blocked_by_pinned_slot) {
+        bool & blocked_by_pinned_slot,
+        std::vector<uint8_t> * protected_slot_scratch = nullptr) {
     if (!pool || !expert_ids || expert_id_count == 0 || expert_id_count > (size_t) pool->capacity) {
         return false;
     }
@@ -1594,7 +1680,9 @@ static bool plan_pool_slots(
     plan.slot_by_expert = pool->slot_by_expert;
     plan.expert_by_slot = pool->expert_by_slot;
     blocked_by_pinned_slot = false;
-    std::vector<uint8_t> protected_slot((size_t) pool->capacity, 0);
+    std::vector<uint8_t> protected_slot_local;
+    std::vector<uint8_t> & protected_slot = protected_slot_scratch ? *protected_slot_scratch : protected_slot_local;
+    protected_slot.assign((size_t) pool->capacity, 0);
 
     for (size_t i = 0; i < expert_id_count; ++i) {
         const int32_t expert = expert_ids[i];
@@ -1744,26 +1832,18 @@ static bool moevm_graph_fill_pool_for_topk(
         return false;
     }
 
-    std::vector<pool_weight_slot *> component_slots;
-    for (pool_weight_slot & slot : state->pool_weight_slots) {
-        if (slot.backend == state->moevm_graph_backend &&
-                slot.buft == state->moevm_graph_buft &&
-                slot.layer == layer &&
-                slot.src_tensor != nullptr) {
-            component_slots.push_back(&slot);
-        }
-    }
-    if (component_slots.empty()) {
+    const std::vector<size_t> & component_slot_indices = moevm_graph_pool_component_slot_indices(state, layer);
+    if (component_slot_indices.empty()) {
         return true;
     }
 
-    pool_weight_slot * first_slot = component_slots.front();
+    pool_weight_slot * first_slot = &state->pool_weight_slots[component_slot_indices.front()];
     const int64_t n_expert = first_slot->src_tensor->ne[2];
     const size_t ids_data_count = ggml_nbytes(ids_tensor) / sizeof(int32_t);
     const int32_t * ids_data = (const int32_t *) ids_bytes;
-    std::vector<int32_t> unique_ids;
+    std::vector<int32_t> & unique_ids = state->graph_pool_unique_ids_scratch;
     std::string collect_error;
-    if (!collect_unique_i32_ids(ids_tensor, ids_data, ids_data_count, n_expert, unique_ids, &collect_error)) {
+    if (!collect_unique_i32_ids(ids_tensor, ids_data, ids_data_count, n_expert, unique_ids, &collect_error, &state->graph_pool_used_ids_scratch)) {
         moevm_set_runtime_error(state, std::string("MoEVM graph-mode failed to collect topk ids: ") + collect_error);
         ++state->moevm_graph_fill_fallback;
         return false;
@@ -1778,7 +1858,8 @@ static bool moevm_graph_fill_pool_for_topk(
         return false;
     }
     try {
-        std::vector<uint32_t> selected;
+        std::vector<uint32_t> & selected = state->graph_pool_selected_scratch;
+        selected.clear();
         selected.reserve(unique_ids.size());
         for (int32_t id : unique_ids) {
             if (id >= 0) {
@@ -1807,16 +1888,18 @@ static bool moevm_graph_fill_pool_for_topk(
         ++state->moevm_pool_epoch_drains;
     }
 
-    pool_slot_plan plan;
+    pool_slot_plan & plan = state->graph_pool_plan_scratch;
     bool blocked_by_pinned_slot = false;
     maybe_force_pinned_fence_once(state, layer_pool, unique_ids.data(), unique_ids.size());
-    bool pool_ok = plan_pool_slots(state, layer_pool, unique_ids.data(), unique_ids.size(), plan, blocked_by_pinned_slot);
+    bool pool_ok = plan_pool_slots(
+            state, layer_pool, unique_ids.data(), unique_ids.size(), plan, blocked_by_pinned_slot, &state->graph_pool_protected_slot_scratch);
     if (!pool_ok && blocked_by_pinned_slot) {
         ggml_backend_synchronize(state->moevm_graph_backend);
         state->moevm_pool_completed_epoch = state->moevm_pool_submit_epoch;
         ++state->moevm_pool_forced_fences;
         blocked_by_pinned_slot = false;
-        pool_ok = plan_pool_slots(state, layer_pool, unique_ids.data(), unique_ids.size(), plan, blocked_by_pinned_slot);
+        pool_ok = plan_pool_slots(
+                state, layer_pool, unique_ids.data(), unique_ids.size(), plan, blocked_by_pinned_slot, &state->graph_pool_protected_slot_scratch);
     }
     if (!pool_ok) {
         moevm_set_runtime_error(state, "MoEVM graph-mode failed to plan pool slots");
@@ -1825,7 +1908,8 @@ static bool moevm_graph_fill_pool_for_topk(
         return false;
     }
 
-    std::vector<int32_t> remap((size_t) n_expert, -1);
+    std::vector<int32_t> & remap = state->graph_pool_remap_scratch;
+    remap.assign((size_t) n_expert, -1);
     for (size_t j = 0; j < unique_ids.size(); ++j) {
         const int32_t expert = unique_ids[j];
         if (expert >= 0 && expert < n_expert) {
@@ -1833,7 +1917,7 @@ static bool moevm_graph_fill_pool_for_topk(
         }
     }
 
-    std::vector<int32_t> shadow_ids_tmp;
+    std::vector<int32_t> & shadow_ids_tmp = state->graph_pool_shadow_ids_scratch;
     if (!build_shadow_ids_remap_i32(ids_tensor, ids_data, ids_data_count, shadow, remap, n_expert, shadow_ids_tmp)) {
         moevm_set_runtime_error(state, "MoEVM graph-mode failed to remap shadow ids");
         ++state->moevm_pool_fallback_remap;
@@ -1842,8 +1926,10 @@ static bool moevm_graph_fill_pool_for_topk(
     }
 
     const int64_t pool_tensor_extent = moevm_pool_tensor_extent(state, plan);
-    std::vector<std::pair<pool_weight_slot *, int32_t>> touched_slots;
-    for (pool_weight_slot * pool_slot : component_slots) {
+    std::vector<std::pair<size_t, int32_t>> & touched_slots = state->graph_pool_touched_slots_scratch;
+    touched_slots.clear();
+    for (size_t slot_index : component_slot_indices) {
+        pool_weight_slot * pool_slot = &state->pool_weight_slots[slot_index];
         if (!pool_slot || !pool_slot->tensor || !pool_slot->tensor->data || !pool_slot->src_tensor) {
             pool_ok = false;
             break;
@@ -1860,7 +1946,8 @@ static bool moevm_graph_fill_pool_for_topk(
         }
 
         bool needs_record = false;
-        for (pool_weight_slot * pool_slot : component_slots) {
+        for (size_t slot_index : component_slot_indices) {
+            pool_weight_slot * pool_slot = &state->pool_weight_slots[slot_index];
             if (pool_slot->loaded_expert_by_slot[(size_t) slot] == (int32_t) expert) {
                 ++state->moevm_pool_component_hits;
             } else {
@@ -1874,7 +1961,8 @@ static bool moevm_graph_fill_pool_for_topk(
         try {
             moevm::RecordView record = state->runtime->wait_selected(layer, expert);
             moevm_record_guard record_guard(state->runtime.get(), record);
-            for (pool_weight_slot * pool_slot : component_slots) {
+            for (size_t slot_index : component_slot_indices) {
+                pool_weight_slot * pool_slot = &state->pool_weight_slots[slot_index];
                 if (pool_slot->loaded_expert_by_slot[(size_t) slot] == (int32_t) expert) {
                     continue;
                 }
@@ -1887,7 +1975,7 @@ static bool moevm_graph_fill_pool_for_topk(
                 }
                 std::memcpy((uint8_t *) pool_slot->tensor->data + (size_t) slot * pool_slot->expert_size, view.data, view.bytes);
                 pool_slot->loaded_expert_by_slot[(size_t) slot] = (int32_t) expert;
-                touched_slots.push_back({pool_slot, slot});
+                touched_slots.push_back({slot_index, slot});
                 ++state->moevm_pool_component_misses;
                 ++state->moevm_copy_memcpy_ops;
                 ++state->moevm_copy_experts;
@@ -1902,8 +1990,11 @@ static bool moevm_graph_fill_pool_for_topk(
 
     if (!pool_ok) {
         for (const auto & touched : touched_slots) {
-            if (touched.first && touched.second >= 0 && touched.second < (int32_t) touched.first->loaded_expert_by_slot.size()) {
-                touched.first->loaded_expert_by_slot[(size_t) touched.second] = -1;
+            if (touched.first < state->pool_weight_slots.size()) {
+                pool_weight_slot & touched_slot = state->pool_weight_slots[touched.first];
+                if (touched.second >= 0 && touched.second < (int32_t) touched_slot.loaded_expert_by_slot.size()) {
+                    touched_slot.loaded_expert_by_slot[(size_t) touched.second] = -1;
+                }
             }
         }
         ++state->moevm_pool_fallback_fill;
@@ -1996,13 +2087,7 @@ static bool moevm_graph_pool_sched_cb(
         return false;
     }
 
-    pool_weight_slot * matched_slot = nullptr;
-    for (pool_weight_slot & slot : state->pool_weight_slots) {
-        if (slot.tensor == node->src[0]) {
-            matched_slot = &slot;
-            break;
-        }
-    }
+    pool_weight_slot * matched_slot = moevm_graph_pool_slot_for_tensor(state, node->src[0]);
     if (!matched_slot) {
         moevm_set_runtime_error(state, "MoEVM graph pool scheduler could not match pool tensor");
         return false;
@@ -2731,6 +2816,132 @@ static bool run_trace(llama_context * ctx, const common_params & params, moe_tra
         LOG_ERR("%s: invalid n_batch = %d\n", __func__, n_batch);
         return false;
     }
+    const int n_parallel = std::max(1, state.moevm_parallel_seqs);
+    if (n_parallel > 1) {
+        if (n_predict <= 0) {
+            LOG_ERR("%s: --moevm-parallel-seqs requires -n > 0\n", __func__);
+            return false;
+        }
+        if (n_batch < n_parallel) {
+            LOG_ERR("%s: --moevm-parallel-seqs=%d requires -b >= %d\n", __func__, n_parallel, n_parallel);
+            return false;
+        }
+        if (tokens.size() < 2) {
+            LOG_ERR("%s: --moevm-parallel-seqs requires a prompt with at least 2 tokens\n", __func__);
+            return false;
+        }
+
+        llama_batch batch = llama_batch_init(n_batch, 0, n_parallel);
+        const moevm_phase_snapshot phase_start = moevm_take_phase_snapshot(state);
+        const int64_t prefix_tokens = (int64_t) tokens.size() - 1;
+        std::vector<int64_t> seq_pos((size_t) n_parallel, 0);
+        std::vector<llama_token> next_input((size_t) n_parallel, tokens.back());
+        std::vector<llama_sampler *> samplers;
+        samplers.reserve((size_t) n_parallel);
+        for (int seq = 0; seq < n_parallel; ++seq) {
+            llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
+            sparams.no_perf = true;
+            llama_sampler * sampler = llama_sampler_chain_init(sparams);
+            llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+            samplers.push_back(sampler);
+        }
+
+        for (int seq = 0; seq < n_parallel; ++seq) {
+            int64_t n_past = 0;
+            const std::vector<llama_seq_id> seq_ids{(llama_seq_id) seq};
+            while (n_past < prefix_tokens) {
+                common_batch_clear(batch);
+                const int64_t n_eval = std::min<int64_t>(n_batch, prefix_tokens - n_past);
+                for (int64_t i = 0; i < n_eval; ++i) {
+                    common_batch_add(batch, tokens[(size_t) (n_past + i)], n_past + i, seq_ids, false);
+                }
+
+                moevm_prepare_decode_state(state, n_past, n_eval);
+                if (llama_decode(ctx, batch) != 0) {
+                    LOG_ERR("%s: llama_decode failed during parallel prefill seq=%d offset=%lld\n",
+                            __func__, seq, (long long) n_past);
+                    for (llama_sampler * sampler : samplers) {
+                        llama_sampler_free(sampler);
+                    }
+                    llama_batch_free(batch);
+                    return false;
+                }
+                n_past += n_eval;
+            }
+            seq_pos[(size_t) seq] = prefix_tokens;
+            LOG_INF("parallel prefilled seq %d/%d prompt_prefix=%lld / %zu records=%lld\n",
+                    seq + 1, n_parallel, (long long) prefix_tokens, tokens.size(), (long long) state.records);
+        }
+
+        const moevm_phase_snapshot phase_after_prefill = moevm_take_phase_snapshot(state);
+        moevm_log_phase_delta("prefill", phase_start, phase_after_prefill);
+
+        const int64_t t_decode_start = ggml_time_us();
+        int32_t steps_decoded = 0;
+        int64_t total_decoded = 0;
+        for (; steps_decoded < n_predict; ++steps_decoded) {
+            common_batch_clear(batch);
+            for (int seq = 0; seq < n_parallel; ++seq) {
+                const std::vector<llama_seq_id> seq_ids{(llama_seq_id) seq};
+                common_batch_add(batch, next_input[(size_t) seq], seq_pos[(size_t) seq], seq_ids, true);
+            }
+
+            moevm_prepare_decode_state(state, steps_decoded, n_parallel);
+            if (llama_decode(ctx, batch) != 0) {
+                LOG_ERR("%s: llama_decode failed during parallel decode step=%d\n", __func__, steps_decoded);
+                for (llama_sampler * sampler : samplers) {
+                    llama_sampler_free(sampler);
+                }
+                llama_batch_free(batch);
+                return false;
+            }
+
+            for (int seq = 0; seq < n_parallel; ++seq) {
+                const float * logits = llama_get_logits_ith(ctx, seq);
+                llama_token token = llama_sampler_sample(samplers[(size_t) seq], ctx, seq);
+                if (!state.write_logits_row((uint32_t) total_decoded, token, logits)) {
+                    LOG_ERR("%s: failed to write parallel logits row %lld\n", __func__, (long long) total_decoded);
+                    for (llama_sampler * sampler : samplers) {
+                        llama_sampler_free(sampler);
+                    }
+                    llama_batch_free(batch);
+                    return false;
+                }
+                llama_sampler_accept(samplers[(size_t) seq], token);
+                state.generated_tokens.push_back(token);
+                next_input[(size_t) seq] = token;
+                ++seq_pos[(size_t) seq];
+                ++total_decoded;
+            }
+        }
+        const int64_t t_decode_end = ggml_time_us();
+        const double decode_s = (double) (t_decode_end - t_decode_start) / 1000000.0;
+        LOG_INF("parallel decoded %lld tokens (%d seqs x %d steps) in %.3fs, %.2f aggregate tok/s, %.2f tok/s/seq, records=%lld\n",
+                (long long) total_decoded,
+                n_parallel,
+                steps_decoded,
+                decode_s,
+                decode_s > 0.0 ? (double) total_decoded / decode_s : 0.0,
+                decode_s > 0.0 ? (double) steps_decoded / decode_s : 0.0,
+                (long long) state.records);
+        std::string token_ids = "generated_token_ids=[";
+        for (size_t i = 0; i < state.generated_tokens.size(); ++i) {
+            if (i) {
+                token_ids += ",";
+            }
+            token_ids += std::to_string(state.generated_tokens[i]);
+        }
+        token_ids += "]";
+        LOG_INF("%s\n", token_ids.c_str());
+
+        for (llama_sampler * sampler : samplers) {
+            llama_sampler_free(sampler);
+        }
+        const moevm_phase_snapshot phase_after_decode = moevm_take_phase_snapshot(state);
+        moevm_log_phase_delta("decode", phase_after_prefill, phase_after_decode);
+        llama_batch_free(batch);
+        return true;
+    }
 
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
     int64_t n_past = 0;
@@ -3212,6 +3423,7 @@ int main(int argc, char ** argv) {
     state.moevm_test_force_pinned_fence = moevm_params.test_force_pinned_fence;
     state.moevm_inject_delay_max_us = moevm_params.inject_delay_max_us;
     state.moevm_delay_state = moevm_params.inject_delay_seed;
+    state.moevm_parallel_seqs = std::max(1, moevm_params.parallel_seqs);
     state.moevm_graph_mode_value = moevm_params.graph_mode;
     state.moevm_pressure_trim_step_bytes = moevm_gib_to_bytes(moevm_params.pressure_trim_step_gib);
     state.moevm_pressure_trim_min_bytes = moevm_gib_to_bytes(moevm_params.pressure_trim_min_gib);
