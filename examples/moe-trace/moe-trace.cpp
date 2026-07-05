@@ -60,6 +60,7 @@ struct moevm_local_params {
     int compact_k_max = 64;
     int pool_layer = -1;
     int pool_capacity = 10;
+    bool pool_dynamic_extent = false;
     bool resident_cache = false;
     bool defer_input_wait = true;
     bool self_test_pool_pinning = false;
@@ -225,6 +226,9 @@ struct moe_trace_state {
     uint64_t moevm_pool_epoch_drains = 0;
     uint64_t moevm_pool_forced_fences = 0;
     uint64_t moevm_pool_pinned_eviction_skips = 0;
+    uint64_t moevm_pool_dynamic_extent_calls = 0;
+    uint64_t moevm_pool_dynamic_extent_sum = 0;
+    uint64_t moevm_pool_dynamic_extent_max = 0;
     uint64_t moevm_delay_injections = 0;
     uint64_t moevm_delay_us = 0;
     uint64_t moevm_delay_state = 0x9e3779b97f4a7c15ull;
@@ -250,6 +254,7 @@ struct moe_trace_state {
     int moevm_compact_k_max = 64;
     int moevm_pool_layer = -1;
     int moevm_pool_capacity = 10;
+    bool moevm_pool_dynamic_extent = false;
     bool moevm_resident_cache = false;
     bool moevm_defer_input_wait = false;
     bool moevm_test_force_pinned_fence = false;
@@ -1004,6 +1009,14 @@ static bool parse_local_arg(
             moevm_params.pool_capacity = std::atoi(arg.substr(std::strlen("--moevm-pool-capacity=")).c_str());
             continue;
         }
+        if (arg == "--moevm-pool-dynamic-extent") {
+            moevm_params.pool_dynamic_extent = true;
+            continue;
+        }
+        if (arg.rfind("--moevm-pool-dynamic-extent=", 0) == 0) {
+            moevm_params.pool_dynamic_extent = std::atoi(arg.substr(std::strlen("--moevm-pool-dynamic-extent=")).c_str()) != 0;
+            continue;
+        }
         if (arg == "--moevm-defer-input-wait") {
             moevm_params.defer_input_wait = true;
             continue;
@@ -1667,6 +1680,26 @@ static void commit_pool_slot_plan(
     }
 }
 
+static int64_t moevm_pool_tensor_extent(
+        moe_trace_state * state,
+        const pool_slot_plan & plan) {
+    if (!state || !state->moevm_pool_dynamic_extent) {
+        return state ? state->moevm_pool_capacity : 0;
+    }
+
+    int64_t extent = 1;
+    for (int32_t slot : plan.slot_by_selected) {
+        if (slot >= 0) {
+            extent = std::max<int64_t>(extent, (int64_t) slot + 1);
+        }
+    }
+    extent = std::min<int64_t>(std::max<int64_t>(extent, 1), state->moevm_pool_capacity);
+    ++state->moevm_pool_dynamic_extent_calls;
+    state->moevm_pool_dynamic_extent_sum += (uint64_t) extent;
+    state->moevm_pool_dynamic_extent_max = std::max<uint64_t>(state->moevm_pool_dynamic_extent_max, (uint64_t) extent);
+    return extent;
+}
+
 static void moevm_prefetch_candidates_cached(
         moe_trace_state * state,
         uint32_t layer,
@@ -1808,13 +1841,14 @@ static bool moevm_graph_fill_pool_for_topk(
         return false;
     }
 
+    const int64_t pool_tensor_extent = moevm_pool_tensor_extent(state, plan);
     std::vector<std::pair<pool_weight_slot *, int32_t>> touched_slots;
     for (pool_weight_slot * pool_slot : component_slots) {
         if (!pool_slot || !pool_slot->tensor || !pool_slot->tensor->data || !pool_slot->src_tensor) {
             pool_ok = false;
             break;
         }
-        pool_slot->tensor->ne[2] = state->moevm_pool_capacity;
+        pool_slot->tensor->ne[2] = pool_tensor_extent;
     }
 
     for (size_t j = 0; pool_ok && j < unique_ids.size(); ++j) {
@@ -2334,7 +2368,7 @@ static bool moevm_weight_copy_cb(
 
                         std::vector<int32_t> touched_slots;
                         if (pool_ok) {
-                            pool_slot->tensor->ne[2] = state->moevm_pool_capacity;
+                            pool_slot->tensor->ne[2] = moevm_pool_tensor_extent(state, plan);
                             for (size_t j = 0; j < expert_id_count; ++j) {
                                 const uint32_t expert = (uint32_t) expert_ids[j];
                                 const int32_t slot = plan.slot_by_selected[j];
@@ -3171,6 +3205,7 @@ int main(int argc, char ** argv) {
     state.moevm_compact_k_max = std::max(1, moevm_params.compact_k_max);
     state.moevm_pool_layer = moevm_params.pool_layer;
     state.moevm_pool_capacity = std::max(1, moevm_params.pool_capacity);
+    state.moevm_pool_dynamic_extent = moevm_params.pool_dynamic_extent;
     state.moevm_resident_cache = moevm_params.resident_cache;
     state.moevm_defer_input_wait = moevm_params.defer_input_wait &&
         (moevm_params.pool_layer != -1 || moevm_params.compact_layer != -1);
@@ -3269,7 +3304,7 @@ int main(int argc, char ** argv) {
             } else {
                 ggml_backend_set_moe_weight_copy_callback(nullptr, nullptr);
             }
-            LOG_INF("MoEVM enabled: arena=%.2fGiB inflight=%.2fMiB threads=%d prefetch_topk=%d active_experts=%d active_experts_renorm=%d copy_debug=%d direct_mmap=%d nocache=%d copy_mode=%s shadow_ids=%d compact_layer=%d compact_k_max=%d pool_layer=%d pool_capacity=%d graph_mode=%s resident_cache=%d defer_input_wait=%d inject_delay_us=%u test_force_pinned_fence=%d pressure_trim=%d pressure_trim_step_gib=%.2f pressure_trim_min_gib=%.2f\n",
+            LOG_INF("MoEVM enabled: arena=%.2fGiB inflight=%.2fMiB threads=%d prefetch_topk=%d active_experts=%d active_experts_renorm=%d copy_debug=%d direct_mmap=%d nocache=%d copy_mode=%s shadow_ids=%d compact_layer=%d compact_k_max=%d pool_layer=%d pool_capacity=%d pool_dynamic_extent=%d graph_mode=%s resident_cache=%d defer_input_wait=%d inject_delay_us=%u test_force_pinned_fence=%d pressure_trim=%d pressure_trim_step_gib=%.2f pressure_trim_min_gib=%.2f\n",
                     moevm_params.arena_gib, moevm_params.inflight_mib, moevm_params.threads, moevm_params.prefetch_topk, moevm_params.active_experts, moevm_params.active_experts_renorm ? 1 : 0, moevm_params.copy_debug, moevm_params.direct_mmap ? 1 : 0,
                     moevm_params.nocache ? 1 : 0,
                     moevm_copy_mode_name(moevm_params.copy_mode),
@@ -3278,6 +3313,7 @@ int main(int argc, char ** argv) {
                     std::max(1, moevm_params.compact_k_max),
                     moevm_params.pool_layer,
                     std::max(1, moevm_params.pool_capacity),
+                    moevm_params.pool_dynamic_extent ? 1 : 0,
                     moevm_graph_mode_name(state.moevm_graph_mode_value),
                     moevm_params.resident_cache ? 1 : 0,
                     state.moevm_defer_input_wait ? 1 : 0,
@@ -3397,7 +3433,7 @@ int main(int argc, char ** argv) {
             runtime_error_first = state.runtime_error;
             runtime_error_last = state.runtime_error_last;
         }
-        LOG_INF("MoEVM prefetch_records=%llu copy_prefetches=%llu copy_prefetch_skips=%llu copy_hook_calls=%llu handled=%llu copied_experts=%llu copied_bytes=%llu copy_mode=%s async_ops=%llu memcpy_ops=%llu shadow_ids_attempts=%llu shadow_ids_applied=%llu shadow_ids_fallback=%llu compact_attempts=%llu compact_applied=%llu compact_fallback=%llu fallback_k_overflow=%llu pool_attempts=%llu pool_applied=%llu pool_fallback=%llu pool_component_hits=%llu pool_component_misses=%llu pool_evictions=%llu pool_fallback_shape=%llu pool_fallback_ids_read=%llu pool_fallback_alloc=%llu pool_fallback_alloc_layer=%llu pool_fallback_alloc_pool=%llu pool_fallback_alloc_pool_data=%llu pool_fallback_alloc_shadow=%llu pool_fallback_alloc_shadow_data=%llu pool_fallback_alloc_shadow_bytes=%llu pool_fallback_plan=%llu pool_fallback_remap=%llu pool_fallback_fill=%llu pool_submit_epoch=%llu pool_completed_epoch=%llu pool_epoch_drains=%llu pool_forced_fences=%llu pool_pinned_eviction_skips=%llu graph_patch_attempts=%llu graph_patch_applied=%llu graph_patch_fallback=%llu graph_topk_fills=%llu graph_fill_fallback=%llu delay_injections=%llu delay_us=%llu resident_cache_hits=%llu resident_cache_misses=%llu resident_cache_resets=%llu runtime_errors=%llu\n",
+        LOG_INF("MoEVM prefetch_records=%llu copy_prefetches=%llu copy_prefetch_skips=%llu copy_hook_calls=%llu handled=%llu copied_experts=%llu copied_bytes=%llu copy_mode=%s async_ops=%llu memcpy_ops=%llu shadow_ids_attempts=%llu shadow_ids_applied=%llu shadow_ids_fallback=%llu compact_attempts=%llu compact_applied=%llu compact_fallback=%llu fallback_k_overflow=%llu pool_attempts=%llu pool_applied=%llu pool_fallback=%llu pool_component_hits=%llu pool_component_misses=%llu pool_evictions=%llu pool_fallback_shape=%llu pool_fallback_ids_read=%llu pool_fallback_alloc=%llu pool_fallback_alloc_layer=%llu pool_fallback_alloc_pool=%llu pool_fallback_alloc_pool_data=%llu pool_fallback_alloc_shadow=%llu pool_fallback_alloc_shadow_data=%llu pool_fallback_alloc_shadow_bytes=%llu pool_fallback_plan=%llu pool_fallback_remap=%llu pool_fallback_fill=%llu pool_submit_epoch=%llu pool_completed_epoch=%llu pool_epoch_drains=%llu pool_forced_fences=%llu pool_pinned_eviction_skips=%llu pool_dynamic_extent_calls=%llu pool_dynamic_extent_sum=%llu pool_dynamic_extent_max=%llu graph_patch_attempts=%llu graph_patch_applied=%llu graph_patch_fallback=%llu graph_topk_fills=%llu graph_fill_fallback=%llu delay_injections=%llu delay_us=%llu resident_cache_hits=%llu resident_cache_misses=%llu resident_cache_resets=%llu runtime_errors=%llu\n",
                 (unsigned long long) state.moevm_prefetch_records,
                 (unsigned long long) state.moevm_copy_prefetches,
                 (unsigned long long) state.moevm_copy_prefetch_skips,
@@ -3438,6 +3474,9 @@ int main(int argc, char ** argv) {
                 (unsigned long long) state.moevm_pool_epoch_drains,
                 (unsigned long long) state.moevm_pool_forced_fences,
                 (unsigned long long) state.moevm_pool_pinned_eviction_skips,
+                (unsigned long long) state.moevm_pool_dynamic_extent_calls,
+                (unsigned long long) state.moevm_pool_dynamic_extent_sum,
+                (unsigned long long) state.moevm_pool_dynamic_extent_max,
                 (unsigned long long) state.moevm_graph_patch_attempts,
                 (unsigned long long) state.moevm_graph_patch_applied,
                 (unsigned long long) state.moevm_graph_patch_fallback,
